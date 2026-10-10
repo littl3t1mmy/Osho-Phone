@@ -745,14 +745,24 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
     return Array.from(H, (x) => x.toString(16).padStart(8, "0")).join("");
   }
 
-  /* A message's fingerprint exactly as tools/relay/relay.py message_sha() takes it: leading blank lines and agents'
-     [ingested as ...] / [answered in ...] stamps are skipped, the rest hashed as is, so a stamp added later never
-     makes a message read as changed. */
-  const STAMP_RE = /^\[(ingested as|answered in) [BG]-\d+\b[^\]]*\]/;
+  /* A message's fingerprint exactly as tools/relay/relay.py message_sha() takes it, so a stamp added later never
+     makes a message read as changed. B-1513: first, the stamp inbox/log.py's mark_source() puts below the top (a blank
+     line, then exactly [ingested as B-NNNN], stacked ones too) is dropped from right after the first Date: / STATUS:
+     line or a line-0 # heading, where its loop puts it; anything else there is content. Then leading blank lines and
+     agents' [ingested as ...] / [answered in ...] stamps are skipped, the rest hashed as is. Python's own strip(), \d
+     and \b, not trim()'s: trim() also drops a BOM and Python's doesn't, so a BOM line read differently (Codex,
+     20261009-230820; drill_app W2b checks both sides agree). */
+  const PY_SPACE = "\\t\\n\\v\\f\\r\\x1c-\\x1f \\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+  const PY_STRIP = new RegExp(`^[${PY_SPACE}]+|[${PY_SPACE}]+$`, "gu");
+  const STAMP_RE = /^\[(ingested as|answered in) [BG]-\p{Nd}+(?![\p{L}\p{N}_])[^\]]*\]/u;
+  const LOG_STAMP_RE = /^\[ingested as B-[0-9]{4,}\]$/;
   function messageSha(text) {
     const lines = text.split("\n");
+    const k = lines.findIndex((ln, n) => ln.startsWith("Date:") || ln.startsWith("STATUS:") || (n === 0 && ln.startsWith("#")));
+    if (k >= 0) while (k + 2 < lines.length && lines[k + 1] === "" && LOG_STAMP_RE.test(lines[k + 2])) lines.splice(k + 1, 2);
+    const strip = (s) => s.replace(PY_STRIP, "");
     let i = 0;
-    while (i < lines.length && (!lines[i].trim() || STAMP_RE.test(lines[i].trim()))) i++;
+    while (i < lines.length && (!strip(lines[i]) || STAMP_RE.test(strip(lines[i])))) i++;
     return sha256Hex(lines.slice(i).join("\n"));
   }
 
