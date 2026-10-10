@@ -236,10 +236,16 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
   /* Where a phone may create files (B-1455): a seen receipt, a message to Fable, a message to Zeus. Stage 2 adds an
      alert's "got it" (alert-ack/v1 only) and a project's "caught up" (caught-up/v1 only). Nothing else. */
   const GITHUB_WRITABLE = ["inbox/seen/", "inbox/messages/", "inbox/lanes/zeus/messages/", "inbox/alerts/", "inbox/caught-up/"];
-  /* What a write into the two event folders must be: its schema line, and a name the builders below produce. */
+  /* What a write into the two event folders must be: a name the builders below produce, and the WHOLE payload in its
+     exact shape, with the name's alert id or project equal to the payload's (Z-0004: the schema line alone let a
+     malformed checkpoint through). */
+  const ISO = "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[+-]\\d{2}:\\d{2}";
   const EVENT_RULES = {
-    "inbox/alerts/": { schema: "schema: alert-ack/v1\n", name: /^[A-Za-z0-9-]{1,60}--ack-\d{8}-\d{6}-[0-9a-f]{12}\.md$/ },
-    "inbox/caught-up/": { schema: "schema: caught-up/v1\n", name: /^[a-z0-9-]{1,60}--caught-up-\d{8}-\d{6}-[0-9a-f]{12}\.md$/ },
+    "inbox/alerts/": { schema: "schema: alert-ack/v1\n", name: /^([A-Za-z0-9-]{1,60})--ack-\d{8}-\d{6}-[0-9a-f]{12}\.md$/,
+      text: new RegExp(`^schema: alert-ack/v1\\nalert_id: ([A-Za-z0-9-]{1,60})\\nby: [a-z]+\\nat: ${ISO}\\n\\n$`) },
+    "inbox/caught-up/": { schema: "schema: caught-up/v1\n", name: /^([a-z0-9-]{1,60})--caught-up-\d{8}-\d{6}-[0-9a-f]{12}\.md$/,
+      text: new RegExp(`^schema: caught-up/v1\\nproject: ([a-z0-9-]{1,60})\\nthrough: [BG]-\\d{4}\\nby: [a-z]+\\n`
+                       + `shown_commit: [0-9a-f]{40}\\nat: ${ISO}\\n\\n$`) },
   };
 
   function GitHubSource(owner, repo, token, fetchFn, apiBase) {
@@ -327,9 +333,12 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
       if (!/^[A-Za-z0-9._\/ -]+$/.test(path) || path.includes("..") || !path.endsWith(".md")
           || !GITHUB_WRITABLE.some((p) => path.startsWith(p) && !path.slice(p.length).includes("/")))
         throw new AppError("Refused to write there", path);
-      for (const [dir, rule] of Object.entries(EVENT_RULES))
-        if (path.startsWith(dir) && (!rule.name.test(path.slice(dir.length)) || !String(text).startsWith(rule.schema)))
-          throw new AppError("Refused to write that there", `${path}: only a ${rule.schema.trim().slice(8)} event`);
+      for (const [dir, rule] of Object.entries(EVENT_RULES)) {
+        if (!path.startsWith(dir)) continue;
+        const n = rule.name.exec(path.slice(dir.length)), t = rule.text.exec(String(text));
+        if (!n || !t || n[1] !== t[1])
+          throw new AppError("Refused to write that there", `${path}: only a whole ${rule.schema.trim().slice(8)} event, named for what it says`);
+      }
       const url = `${base}/contents/${path.split("/").map(encodeURIComponent).join("/")}`;
       const bytes = new TextEncoder().encode(text);
       let bin = "";
@@ -378,6 +387,46 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
         try { return JSON.parse(t); } catch (e) { throw new AppError("A file on GitHub isn't valid JSON", path); }
       },
     };
+  }
+
+  /* Z-0004 (Zeus's Stage 2 review, HIGH): every path the page opens from the index, checked against its exact role
+     and person, never by shape alone. GitHubSource may read all of inbox/ and agenda/, so without this a bad index could
+     steer the page into another person's lane. Each rule is a whole-path match on plain characters only:
+       thread  Caleb's inbox/messages/<file>; Garrett's inbox/lanes/garrett/messages/<file>
+       entry   the number decides the folder and starts the file name, and the person decides which numbers:
+               Caleb B (inbox/ledger/) and Z (inbox/lanes/zeus/ledger/); Garrett G (his lane's ledger/)
+       today   exactly agenda/today-<person>.md
+       lane    Caleb only: a plain file name in inbox/lanes/zeus/messages/ */
+  // The file part: never starting with a dot, no "..", and none of / \ % or a control character, so an encoded or
+  // traversing name is refused here, not left to the source (Codex, 20261009-202714). A real name can hold a space or a
+  // colon ("Onyx timer: 60m.md"), so those stay. Matching is case-sensitive and nothing is normalized.
+  const FILE = "(?!\\.)(?!.*\\.\\.)[^/\\\\%\\u0000-\\u001f\\u007f]*\\.md";
+  const THREAD_DIRS = { caleb: "inbox/messages/", garrett: "inbox/lanes/garrett/messages/" };
+  // Placement: a person's own entries (Caleb B, Garrett G) for replies, ledger, project and READY rows; Zeus's Z
+  // entries only in Caleb's Zeus lane. A Z row in a project, or a B row in the Zeus lane, is refused.
+  const ENTRY_DIRS = { entry: { caleb: { B: "inbox/ledger/" }, garrett: { G: "inbox/lanes/garrett/ledger/" } },
+                       zeus: { caleb: { Z: "inbox/lanes/zeus/ledger/" }, garrett: {} } };
+  const LANE_DIR = "inbox/lanes/zeus/messages/";
+  function allowedPath(person, role, path, number) {
+    if (typeof path !== "string" || !Object.prototype.hasOwnProperty.call(THREAD_DIRS, person)) return false;
+    const whole = (dir, file) => path.startsWith(dir) && new RegExp(`^${file}$`).test(path.slice(dir.length));
+    if (role === "thread") return whole(THREAD_DIRS[person], FILE);
+    if (role === "today") return path === `agenda/today-${person}.md`;
+    if (role === "lane") return person === "caleb" && whole(LANE_DIR, FILE);
+    if (role === "entry" || role === "zeus") {
+      const m = /^([BGZ])-(\d{4})$/.exec(typeof number === "string" ? number : "");
+      const dir = m && ENTRY_DIRS[role][person][m[1]];
+      return !!dir && whole(dir, `(?!.*\\.\\.)${m[1]}-${m[2]}(?:-[A-Za-z0-9._-]*)?\\.md`);   // no ".." here either
+    }
+    return false;
+  }
+  /* The role for opening a ledger row: Zeus's Z rows are read as Zeus-lane entries, everything else as the person's own. */
+  function entryRole(number) { return String(number || "").charAt(0) === "Z" ? "zeus" : "entry"; }
+  /* The same rule at the moment of reading: the page calls this right before every fetch of an indexed path. */
+  function mustPath(person, role, path, number) {
+    if (!allowedPath(person, role, path, number))
+      throw new AppError("Refused a path the index shouldn't name", `${role}${number ? ` ${number}` : ""}: ${String(path).slice(0, 120)}`);
+    return path;
   }
 
   /* The index, checked before anything is drawn from it: a wrong schema or person is an error, never a guess. */
@@ -481,6 +530,30 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
     if (idx.desk_unmatched !== undefined && !(Array.isArray(idx.desk_unmatched)
         && idx.desk_unmatched.every((d) => d && (str(d.slug) || str(d.title)) && optStr(d.source))))
       throw new AppError("The index's unmatched desk items are malformed", person);
+    // Z-0004: every path the page could open, by its role and this person, so a bad index is an error card before
+    // anything is fetched (the page re-checks each one again right before reading it: mustPath).
+    const bad = [];
+    const entryOk = (e) => allowedPath(person, "entry", e.path, e.number) || bad.push(`${e.number} ${e.path}`);
+    if (!allowedPath(person, "today", idx.today)) bad.push(`today ${idx.today}`);
+    for (const t of idx.threads) {
+      if (!allowedPath(person, "thread", t.path)) bad.push(`thread ${t.path}`);
+      (t.replies || []).forEach(entryOk);
+    }
+    (idx.ledger || []).forEach(entryOk);
+    for (const p of idx.projects || []) {
+      (p.latest_rows || []).forEach(entryOk);
+      (p.since_rows || []).forEach(entryOk);
+      if (p.next) {
+        (p.next.ready_items || []).forEach(entryOk);
+        if (p.next.pick && p.next.pick.source === "ready") entryOk(p.next.pick);
+      }
+    }
+    if (idx.zeus !== undefined) {
+      if (person !== "caleb") bad.push("a Zeus lane in someone else's index");
+      for (const e of idx.zeus.ledger || []) if (!allowedPath(person, "zeus", e.path, e.number)) bad.push(`${e.number} ${e.path}`);
+      for (const n of idx.zeus.waiting || []) if (!allowedPath(person, "lane", LANE_DIR + n)) bad.push(`Zeus message ${n}`);
+    }
+    if (bad.length) throw new AppError("The index names a file outside its place", `${bad.length}: ${bad.slice(0, 3).join("; ")}`);
     if (idx.zeus && idx.zeus.intents !== undefined) {
       const z = idx.zeus.intents;
       if (!z || typeof z !== "object" || Array.isArray(z)
@@ -853,6 +926,19 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
              text: `schema: caught-up/v1\nproject: ${project}\nthrough: ${through}\nby: ${person}\nshown_commit: ${shownCommit}\nat: ${isoLocal(now)}\n\n` };
   }
 
+  /* Z-0004: before a "Caught up" is written, it must be the tap the screen offered: the index the project was drawn
+     from is still the one showing (a tap after a Refresh is refused), and `through` is the newest row it displayed
+     under "since you last caught up", the only rows the button sits under (Codex, 20261009-202714). */
+  function checkCheckpoint(idx, projectId, through, shownIdx) {
+    if (shownIdx !== undefined && shownIdx !== idx)
+      throw new AppError("The page refreshed since you saw this", "tap Caught up again on what's showing now");
+    const p = ((idx && idx.projects) || []).find((x) => x && x.id === projectId);
+    const newest = p && Array.isArray(p.since_rows) && p.since_rows[0] ? p.since_rows[0].number : null;
+    if (!p || !/^[BG]-\d{4}$/.test(through || "") || through !== newest)
+      throw new AppError("Can't record that", "the checkpoint isn't the newest entry this project showed");
+    return true;
+  }
+
   /* Quick-links IS MAP.md (DESIGN.md): its tables as [{section, question, links: [{name, path}]}], repo paths only. */
   function mapLinks(md) {
     const out = [];
@@ -919,10 +1005,10 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
 
   const api = { SCHEMA, PEOPLE, PAGE_SIZE, OLD_AFTER_MIN, AppError, LocalSource, GitHubSource, checkIndex, freshness, sortThreads,
                 filterThreads, paginate, threadState, title, careNow, splitMessage, inline, markdownBlocks, todayBody,
-                entryBody, statusWord, slugWords, sha256Hex, messageSha, receipt, phoneMessage, INTENTS, INTENT_NOTICE, PEOPLE_BY_GITHUB_ID, WRITERS, locallySeen,
+                entryBody, statusWord, slugWords, sha256Hex, messageSha, receipt, phoneMessage, INTENTS, INTENT_NOTICE, allowedPath, mustPath, entryRole, PEOPLE_BY_GITHUB_ID, WRITERS, locallySeen,
                 TOKEN_PATTERNS, looksLikeKey,
                 GITHUB_WRITABLE, GITHUB_READABLE_FILES, EVENT_RULES,
-                todayLists, convo, isDirect, whoOf, ledgerTimeline, alertAck, caughtUpEvent, mapLinks, QUICK_REPLIES, staleNote, nextView };
+                todayLists, convo, isDirect, whoOf, ledgerTimeline, alertAck, caughtUpEvent, checkCheckpoint, mapLinks, QUICK_REPLIES, staleNote, nextView };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.PhoneApp = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);
@@ -1134,7 +1220,7 @@ function deskList(items) {
     d.why ? el("span", { class: "why" }, d.why) : null)));
 }
 async function drawToday(main, ctx) {
-  const t = A.todayBody(await src.text(ctx.idx.today));
+  const t = A.todayBody(await src.text(A.mustPath(S.person, "today", ctx.idx.today)));
   if (ctx.gen !== S.gen) return;
   main.append(el("h2", null, ctx.person === "caleb" ? "Today, Caleb" : "Today, Garrett"), staleLine(ctx.idx));
   if (ctx.idx.desk) {
@@ -1195,7 +1281,7 @@ async function drawThread(main, ctx) {
     el("span", { class: "pill" }, st.answer), el("span", { class: "pill" }, t.format || "message"),
     A.convo(t, S.person).intent ? el("span", { class: `kind intent-${t.intent}` }, A.convo(t, S.person).intent) : null));
   if (t.intent && t.intent !== "message") main.append(el("p", { class: "note" }, A.INTENTS[t.intent].means));
-  const text = await src.text(t.path);
+  const text = await src.text(A.mustPath(S.person, "thread", t.path));
   if (ctx.gen !== S.gen) return;
   const shownMsgSha = A.messageSha(text);            // the fingerprint of exactly what's on screen (step 4)
   const m = A.splitMessage(text);
@@ -1212,7 +1298,7 @@ async function drawThread(main, ctx) {
       box.replaceChildren(el("h3", null, rep.number));
       const g = S.gen;
       let content;
-      try { const et = await src.text(rep.path); content = renderMarkdown(A.entryBody(et).body); if (g === S.gen) shown[rep.number] = A.sha256Hex(et); }
+      try { const et = await src.text(A.mustPath(S.person, "entry", rep.path, rep.number)); content = renderMarkdown(A.entryBody(et).body); if (g === S.gen) shown[rep.number] = A.sha256Hex(et); }
       catch (e) { content = errorBox(e); }
       if (g === S.gen) box.append(content);
     } } }, `Read ${rep.number}, the entry that processed it ›`));
@@ -1355,6 +1441,8 @@ function drawLedger(main) {
 }
 function drawProjects(main) {
   const ps = S.idx.projects || [];
+  // Z-0004: a "Caught up" records what THIS drawing showed: its index and the commit it was pinned to.
+  const shownIdx = S.idx, shownPin = src && src.pinned ? src.pinned() : null;
   main.append(el("h2", null, "Projects"), staleLine(S.idx),
     el("p", { class: "note" }, "Each project: its next decision, what's new since you last caught up, and its newest entries. Opening a project never moves your checkpoint; only \"Caught up\" does."));
   if (!ps.length) main.append(el("p", { class: "note" }, "No projects in this index."));
@@ -1382,7 +1470,7 @@ function drawProjects(main) {
       sinceRows.length ? el("ol", { class: "threads" }, sinceRows.map(entryRow)) : null);
     if (sinceRows.length && canWrite()) {
       const note = el("p", { class: "note" });
-      const b = el("button", { type: "button", class: "act", on: { click: () => caughtUp(p, sinceRows[0].number, b, note) } }, "Caught up");
+      const b = el("button", { type: "button", class: "act", on: { click: () => caughtUp(p, sinceRows[0].number, b, note, shownIdx, shownPin) } }, "Caught up");
       sec.append(el("div", { class: "acts" }, b), note);
     }
     if (!sinceRows.length && rows.length) sec.append(el("h4", null, "Newest entries"),
@@ -1441,9 +1529,9 @@ function gotIt(a, button, note) {
   return sendEvent(`ack:${a.alert_id}`, () => ({ ...A.alertAck(S.person, a, new Date(), randHex()), message: `Caleb: got it, ${a.alert_id} (phone)` }),
     button, note, () => { S.acked[a.alert_id] = true; drawChrome(); });
 }
-function caughtUp(p, through, button, note) {
-  const pin = src.pinned && src.pinned();
-  return sendEvent(`caught:${p.id}:${through}`, () => ({ ...A.caughtUpEvent(S.person, p.id, through, pin ? pin.sha : "", new Date(), randHex()),
+function caughtUp(p, through, button, note, shownIdx, shownPin) {
+  // A retry resends the pending event exactly as first built (sendEvent); a fresh tap must match what's showing now.
+  return sendEvent(`caught:${p.id}:${through}`, () => A.checkCheckpoint(S.idx, p.id, through, shownIdx) && ({ ...A.caughtUpEvent(S.person, p.id, through, shownPin ? shownPin.sha : "", new Date(), randHex()),
     message: `Caleb: caught up on ${p.id} through ${through} (phone)` }),
     button, note, () => { S.caught[p.id] = through; draw(); });
 }
@@ -1515,7 +1603,7 @@ async function drawEntry(main, ctx) {
   main.append(backButton(), el("h2", null, `${e.number} · ${A.slugWords(e.title)}`),
     el("div", { class: "state" }, el("span", { class: "pill" + (e.status === "READY" ? " u" : "") }, A.statusWord(e.status)),
       e.at ? el("span", { class: "pill" }, new Date(e.at).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })) : null));
-  const text = await src.text(e.path);
+  const text = await src.text(A.mustPath(S.person, A.entryRole(e.number), e.path, e.number));
   if (ctx.gen !== S.gen) return;
   main.append(renderMarkdown(A.entryBody(text).body), el("p", { class: "note" }, el("code", null, e.path)));
   main.append(canWrite() ? composer(e.number) : writeNote());
@@ -1528,7 +1616,7 @@ async function drawLaneMessage(main, ctx) {
   const li = laneIntent(name);
   if (li) main.append(el("div", { class: "state" }, el("span", { class: `kind intent-${li}` }, A.INTENTS[li].word)),
     el("p", { class: "note" }, A.INTENTS[li].means));
-  const text = await src.text(path);
+  const text = await src.text(A.mustPath(S.person, "lane", path));
   if (ctx.gen !== S.gen) return;
   const m = A.splitMessage(text);
   if (m.fields.length) main.append(el("dl", { class: "fields" }, m.fields.map(([k, v]) => [el("dt", null, k), el("dd", null, v)])));
