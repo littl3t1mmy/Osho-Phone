@@ -112,6 +112,35 @@ nav.tabs button { flex: 1; border: 0; background: none; font: inherit; font-size
 nav.tabs button[aria-current="page"] { color: var(--accent); font-weight: 650; box-shadow: inset 0 2px 0 var(--accent); }
 nav.tabs .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 4px; border-radius: 999px;
   background: var(--care); color: var(--screen); font-size: 0.72rem; font-variant-numeric: tabular-nums; }
+/* Stage 2 (B-1476) */
+.alertrow { background: var(--alert-soft); color: var(--ink); border-top: 1px solid var(--alert); padding: 8px 16px;
+  display: grid; gap: 4px; font-size: 0.86rem; }
+.alertrow .from { color: var(--alert); font-weight: 650; font-size: 0.76rem; letter-spacing: 0.04em; text-transform: uppercase; }
+.alertrow .row { display: flex; gap: 8px; align-items: flex-start; }
+.alertrow .row span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.alertrow button { font: inherit; font-size: 0.8rem; font-weight: 600; border: 1px solid var(--alert); background: var(--screen);
+  color: var(--alert); border-radius: 8px; padding: 3px 10px; cursor: pointer; white-space: nowrap; }
+.stale { font-size: 0.76rem; color: var(--muted); margin: 0 0 8px; font-variant-numeric: tabular-nums; }
+.stale.old { color: var(--alert); font-weight: 600; }
+.kind { font-size: 0.7rem; padding: 0 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.kind.direct { border-color: var(--care); color: var(--care); }
+.kind.decision, .kind.question { border-color: var(--accent); color: var(--accent); }
+.waiting { color: var(--alert); font-weight: 650; }
+.day { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 16px 0 2px;
+  border-bottom: 1px solid var(--line); padding-bottom: 2px; }
+.proj { font-size: 0.82rem; font-weight: 650; margin: 8px 0 0; }
+.desk li { display: grid; gap: 1px; }
+.desk .why { font-size: 0.8rem; color: var(--muted); }
+.links { list-style: none; margin: 0; padding: 0; }
+.links li { display: flex; gap: 8px; align-items: center; padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 0.85rem; }
+.links li span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.links button, .quick button, .moremenu button { font: inherit; font-size: 0.8rem; border: 1px solid var(--line);
+  background: var(--surface); color: var(--ink); border-radius: 8px; padding: 3px 10px; cursor: pointer; }
+.quick { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+.moremenu { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.moremenu button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px;
+  background: var(--surface); color: var(--ink); }
 </style>
 </head>
 <body>
@@ -135,9 +164,10 @@ nav.tabs .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin
   <nav class="tabs" aria-label="Tabs">
     <button type="button" data-tab="today">Today</button>
     <button type="button" data-tab="inbox">Inbox<span class="badge" id="badge" hidden></span></button>
-    <button type="button" data-tab="ledger">Ledger</button>
     <button type="button" data-tab="projects">Projects</button>
+    <button type="button" data-tab="ledger">Ledger</button>
     <button type="button" data-tab="lanes" id="lanes-tab">Lanes</button>
+    <button type="button" data-tab="more">More</button>
   </nav>
 </div>
 <script>
@@ -193,8 +223,17 @@ nav.tabs .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin
      injectable for the drill; the page passes neither. */
   /* Only the folders the page draws from (Codex, 20261009-082346): a GitHubSource can't be pointed elsewhere. */
   const GITHUB_READABLE = ["inbox/", "agenda/"];
-  /* Where a phone may create files (B-1455): a seen receipt, a message to Fable, a message to Zeus. Nothing else. */
-  const GITHUB_WRITABLE = ["inbox/seen/", "inbox/messages/", "inbox/lanes/zeus/messages/"];
+  /* Stage 2 (B-1476): the More tab's two pages, by exact path only. A link inside MAP.md never authorizes reading
+     its target (Codex, 20261009-193507). */
+  const GITHUB_READABLE_FILES = ["MAP.md", "docs/core/protocols-and-lingo.md"];
+  /* Where a phone may create files (B-1455): a seen receipt, a message to Fable, a message to Zeus. Stage 2 adds an
+     alert's "got it" (alert-ack/v1 only) and a project's "caught up" (caught-up/v1 only). Nothing else. */
+  const GITHUB_WRITABLE = ["inbox/seen/", "inbox/messages/", "inbox/lanes/zeus/messages/", "inbox/alerts/", "inbox/caught-up/"];
+  /* What a write into the two event folders must be: its schema line, and a name the builders below produce. */
+  const EVENT_RULES = {
+    "inbox/alerts/": { schema: "schema: alert-ack/v1\n", name: /^[A-Za-z0-9-]{1,60}--ack-\d{8}-\d{6}-[0-9a-f]{12}\.md$/ },
+    "inbox/caught-up/": { schema: "schema: caught-up/v1\n", name: /^[a-z0-9-]{1,60}--caught-up-\d{8}-\d{6}-[0-9a-f]{12}\.md$/ },
+  };
 
   function GitHubSource(owner, repo, token, fetchFn, apiBase) {
     const f = fetchFn || ((u, o) => root.fetch(u, o));
@@ -244,7 +283,8 @@ nav.tabs .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin
     }
     async function get(path) {
       if (!/^[A-Za-z0-9._\/ -]+$/.test(path) || path.includes("..")) throw new AppError("Refused an odd path", path);
-      if (!GITHUB_READABLE.some((p) => path.startsWith(p))) throw new AppError("Refused a path outside the inbox", path);
+      if (!GITHUB_READABLE.some((p) => path.startsWith(p)) && !GITHUB_READABLE_FILES.includes(path))
+        throw new AppError("Refused a path outside the inbox", path);
       if (!pinned) throw new AppError("Not connected yet", "the newest commit hasn't been read");
       const url = `${base}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${pinned.sha}`;
       return (await call(url, "application/vnd.github.raw+json", path)).text();
@@ -280,6 +320,9 @@ nav.tabs .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin
       if (!/^[A-Za-z0-9._\/ -]+$/.test(path) || path.includes("..") || !path.endsWith(".md")
           || !GITHUB_WRITABLE.some((p) => path.startsWith(p) && !path.slice(p.length).includes("/")))
         throw new AppError("Refused to write there", path);
+      for (const [dir, rule] of Object.entries(EVENT_RULES))
+        if (path.startsWith(dir) && (!rule.name.test(path.slice(dir.length)) || !String(text).startsWith(rule.schema)))
+          throw new AppError("Refused to write that there", `${path}: only a ${rule.schema.trim().slice(8)} event`);
       const url = `${base}/contents/${path.split("/").map(encodeURIComponent).join("/")}`;
       const bytes = new TextEncoder().encode(text);
       let bin = "";
@@ -379,6 +422,25 @@ nav.tabs .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin
           || !z.waiting.every(str) || !z.ledger.every((e) => e && str(e.number) && str(e.path) && str(e.status)))
         throw new AppError("The index's Zeus lane is malformed", person);
     }
+    // Stage 2 (B-1476): alerts, catch-up, tags, display labels.
+    const optStr = (v) => v === null || v === undefined || typeof v === "string";
+    if (idx.alerts !== undefined && !(Array.isArray(idx.alerts)
+        && idx.alerts.every((a) => a && str(a.alert_id) && /^[A-Za-z0-9-]{1,60}$/.test(a.alert_id) && str(a.from)
+                                   && typeof a.text === "string" && typeof a.at === "string")))
+      throw new AppError("The index's alerts are malformed", person);
+    for (const p of idx.projects || [])
+      if (!optStr(p.caught_up_through) || (p.since_count !== undefined && !(Number.isInteger(p.since_count) && p.since_count >= 0))
+          || (p.since_rows !== undefined && !(Array.isArray(p.since_rows) && p.since_rows.every((e) => e && str(e.number) && str(e.path)))))
+        throw new AppError("A project's catch-up in the index is malformed", person);
+    for (const e of idx.ledger || [])
+      if (e.projects !== undefined && !(Array.isArray(e.projects) && e.projects.every(str)))
+        throw new AppError("A ledger row's projects in the index are malformed", person);
+    for (const t of idx.threads)
+      if (!optStr(t.sender) || !optStr(t.recipient) || !optStr(t.kind))
+        throw new AppError("A thread's labels in the index are malformed", person);
+    for (const d of idx.desk || [])
+      if (!optStr(d.why) || !optStr(d.added) || (d.minutes != null && !Number.isFinite(d.minutes)))
+        throw new AppError("A desk item in the index is malformed", person);
     return idx;
   }
 
@@ -403,6 +465,7 @@ nav.tabs .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin
     if (filter === "unseen") return threads.filter((t) => t.seen === false);
     if (filter === "needs") return threads.filter((t) => t.asks_you === true);
     if (filter === "unprocessed") return threads.filter((t) => !t.processed_by);
+    if (filter === "direct") return threads.filter((t) => t.kind === "direct");   // Stage 2: direct is the audience
     return threads;
   }
 
@@ -647,11 +710,109 @@ nav.tabs .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin
   /* "phone-app-first-four-steps-say-go" -> "phone app first four steps say go" */
   function slugWords(s) { return String(s || "").replace(/[-_]+/g, " ").trim(); }
 
+  /* ---- Stage 2 (B-1476): the rest of the screens. Pure, so the drill can test them. ---- */
+
+  /* Today's two lists from the desk: blockers (items marked blocking) and everything waiting on you, OLDEST first
+     (DESIGN.md), each with its minutes and one line of why. An item with no date sorts last, never first. */
+  function todayLists(idx) {
+    const desk = (idx.desk || []).slice();
+    const t = (d) => { const v = Date.parse(d.added || ""); return isNaN(v) ? Infinity : v; };
+    desk.sort((a, b) => t(a) - t(b) || String(a.slug || a.title).localeCompare(String(b.slug || b.title)));
+    const minutes = desk.reduce((s, d) => s + (Number.isFinite(d.minutes) ? d.minutes : 0), 0);
+    return { blockers: desk.filter((d) => d.blocking === true), waiting: desk, minutes };
+  }
+
+  const NAMES = { caleb: "Caleb", garrett: "Garrett", fable: "Fable", onyx: "Onyx", zeus: "Zeus" };
+  const KIND_WORDS = ["question", "decision", "fyi", "reply"];
+  /* A conversation's labels, in words. Who -> whom is display only (for free text it's the message's own From:/To:
+     lines, as written): it never decides "waiting for you", routing or seen state (Codex, 20261009-193507). */
+  function convo(t, person) {
+    const nm = (v) => v ? (NAMES[String(v).toLowerCase()] || String(v)) : null;
+    const from = nm(t.sender || t.from), to = nm(t.recipient || (Array.isArray(t.to) ? t.to.join(", ") : t.to));
+    const agent = person === "garrett" ? "Onyx" : "Fable";
+    return {
+      who: from || to ? `${from || "?"} → ${to || "?"}` : null,
+      kinds: [t.kind === "direct" ? "direct" : null, KIND_WORDS.includes(t.purpose) ? t.purpose : null].filter(Boolean),
+      waiting: t.asks_you === true && !t.processed_by,
+      replyNote: t.unseen_reason === "new reply" ? `${agent} replied · you haven't seen this reply` : null,
+    };
+  }
+  function isDirect(t) { return t.kind === "direct"; }
+
+  /* The ledger as a timeline: newest day first, then each day's entries by project, newest first within. Rows with
+     several tags appear under their first; untagged ones under "Other". `who` filters by series (B Fable, Z Zeus,
+     G Onyx); `project` by tag. */
+  function whoOf(number) { return { B: "fable", Z: "zeus", G: "onyx" }[String(number || "").charAt(0)] || "?"; }
+  function ledgerTimeline(rows, opts) {
+    const o = opts || {};
+    const keep = rows.filter((e) => (!o.who || o.who === "all" || whoOf(e.number) === o.who)
+      && (!o.project || o.project === "all" || (e.projects || []).includes(o.project)));
+    const days = new Map();
+    for (const e of keep.slice().sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")) || String(b.number).localeCompare(String(a.number)))) {
+      const day = String(e.at || "").slice(0, 10) || "undated";
+      if (!days.has(day)) days.set(day, new Map());
+      const proj = (e.projects && e.projects[0]) || "Other";
+      const g = days.get(day);
+      if (!g.has(proj)) g.set(proj, []);
+      g.get(proj).push(e);
+    }
+    return [...days.entries()].map(([day, g]) => ({ day, projects: [...g.entries()].map(([project, items]) => ({ project, items })) }));
+  }
+
+  function stamp(now) {
+    const p = (n) => String(n).padStart(2, "0");
+    return `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`;
+  }
+  /* "Got it" on an alert: an alert-ack/v1 event naming it. It acknowledges the alert only (DESIGN.md seen rules). */
+  function alertAck(person, alert, now, rand) {
+    if (!/^[a-z]+$/.test(person) || !alert || !/^[A-Za-z0-9-]{1,60}$/.test(alert.alert_id || "") || !/^[0-9a-f]{12}$/.test(rand))
+      throw new AppError("Can't record that", "the alert is malformed");
+    return { path: `inbox/alerts/${alert.alert_id}--ack-${stamp(now)}-${rand}.md`,
+             text: `schema: alert-ack/v1\nalert_id: ${alert.alert_id}\nby: ${person}\nat: ${isoLocal(now)}\n\n` };
+  }
+  /* "Caught up" on a project: a caught-up/v1 checkpoint naming the person, the project, the newest entry actually
+     shown and the commit it was shown from (DATA.md; Codex, 20261009-193507). The index takes the newest checkpoint,
+     so a late, older tap can't move it backwards. */
+  function caughtUpEvent(person, project, through, shownCommit, now, rand) {
+    if (!/^[a-z]+$/.test(person) || !/^[a-z0-9-]{1,60}$/.test(project || "") || !/^[BG]-\d{4}$/.test(through || "")
+        || !/^[0-9a-f]{40}$/.test(shownCommit || "") || !/^[0-9a-f]{12}$/.test(rand))
+      throw new AppError("Can't record that", "the checkpoint is malformed");
+    return { path: `inbox/caught-up/${project}--caught-up-${stamp(now)}-${rand}.md`,
+             text: `schema: caught-up/v1\nproject: ${project}\nthrough: ${through}\nby: ${person}\nshown_commit: ${shownCommit}\nat: ${isoLocal(now)}\n\n` };
+  }
+
+  /* Quick-links IS MAP.md (DESIGN.md): its tables as [{section, question, links: [{name, path}]}], repo paths only. */
+  function mapLinks(md) {
+    const out = [];
+    let section = "";
+    for (const line of String(md).replace(/\r\n/g, "\n").split("\n")) {
+      const h = line.match(/^##\s+(.*)$/);
+      if (h) { section = h[1].trim(); continue; }
+      const m = line.match(/^\|\s*([^|]+?)\s*\|\s*(.+?)\s*\|\s*$/);
+      if (!m || /^-+$/.test(m[1].replace(/[:\s]/g, "")) || /^question$/i.test(m[1])) continue;
+      const links = [...m[2].matchAll(/\[([^\]]+)\]\(([^)\s]+)\)/g)]
+        .filter((x) => !/^[a-z]+:/i.test(x[2]) && !x[2].includes(".."))
+        .map((x) => ({ name: x[1], path: x[2].replace(/^\.\//, "") }));
+      if (links.length) out.push({ section, question: m[1], links });
+    }
+    return out;
+  }
+
+  /* Short canned answers: they fill the reply box, and you still tap Send (never sent by themselves). */
+  const QUICK_REPLIES = ["Got it.", "Later.", "Yes, go ahead (as a message)."];
+
+  /* One line saying how old this screen's data is (its index's build time; the commit time is in the header). */
+  function staleNote(builtAt, now) {
+    const f = freshness(builtAt, now);
+    return { text: `Data built ${f.label}${f.old ? " · old: tap Refresh" : ""}`, old: f.old };
+  }
+
   const api = { SCHEMA, PEOPLE, PAGE_SIZE, OLD_AFTER_MIN, AppError, LocalSource, GitHubSource, checkIndex, freshness, sortThreads,
                 filterThreads, paginate, threadState, title, careNow, splitMessage, inline, markdownBlocks, todayBody,
                 entryBody, statusWord, slugWords, sha256Hex, messageSha, receipt, phoneMessage, PEOPLE_BY_GITHUB_ID, WRITERS, locallySeen,
                 TOKEN_PATTERNS, looksLikeKey,
-                GITHUB_WRITABLE };
+                GITHUB_WRITABLE, GITHUB_READABLE_FILES, EVENT_RULES,
+                todayLists, convo, isDirect, whoOf, ledgerTimeline, alertAck, caughtUpEvent, mapLinks, QUICK_REPLIES, staleNote };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.PhoneApp = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);
@@ -668,7 +829,9 @@ const MODE = LOOPBACK && location.hash !== "#github" ? "local" : "github";
 let src = MODE === "local" ? A.LocalSource(REPO) : null;
 let connGen = 0;            // each Open, Refresh and Forget supersedes every earlier one (Codex, 20261009-082850)
 const S = { person: "caleb", tab: "today", filter: "all", page: 0, idx: null, open: null, scroll: {}, stripOpen: false,
-            gen: 0, loadGen: 0, lfilter: "all", lpage: 0, me: null, recorded: {}, pending: {} };
+            gen: 0, loadGen: 0, lfilter: "all", lpage: 0, me: null, recorded: {}, pending: {},
+            lwho: "all", lproj: "all", more: "links", acked: {}, caught: {} };
+try { const th = localStorage.getItem("relay.theme"); if (th === "light" || th === "dark") document.documentElement.dataset.theme = th; } catch (e) {}
 try { const p = localStorage.getItem("relay.person"); if (A.PEOPLE.includes(p)) S.person = p; } catch (e) {}
 
 const $ = (s) => document.querySelector(s);
@@ -799,8 +962,8 @@ async function refresh() {
   }
   if (await loadIndex()) draw();
 }
-setInterval(drawFresh, 60000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) drawFresh(); });
+setInterval(() => { drawFresh(); ageStaleLines(); }, 60000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { drawFresh(); ageStaleLines(); } });
 
 function drawChrome() {
   document.querySelectorAll(".seg button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.person === S.person)));
@@ -815,8 +978,21 @@ function drawChrome() {
   if ($("#lanes-tab").hidden && S.tab === "lanes") S.tab = "today";
   const strip = $("#strip");
   const care = S.idx ? A.careNow(S.idx) : [];
-  strip.hidden = !care.length;
+  // Stage 2: the direct alert row sits on top of care-now, one alert at a time, until its own "got it".
+  const alerts = S.idx ? (S.idx.alerts || []).filter((a) => !S.acked[a.alert_id]) : [];
+  strip.hidden = !care.length && !alerts.length;
   strip.replaceChildren();
+  if (alerts.length) {
+    const a = alerts[0];
+    const ago = a.at ? A.freshness(a.at, Date.now()).label : "";
+    const note = el("div", { class: "note" });
+    const got = el("button", { type: "button", on: { click: () => gotIt(a, got, note) } }, "Got it");
+    if (!canWrite()) got.hidden = true;
+    strip.append(el("div", { class: "alertrow", role: "status" },
+      el("span", { class: "from" }, `From ${a.from}${ago ? ` · ${ago}` : ""}${alerts.length > 1 ? ` · ${alerts.length - 1} more` : ""}`),
+      el("div", { class: "row" }, el("span", null, a.text), got), note,
+      canWrite() ? null : el("div", { class: "note" }, "\"Got it\" needs a key that can write.")));
+  }
   if (care.length) {
     const top = care.filter((c) => c.level !== "WHENEVER").length;
     strip.append(el("button", { type: "button", "aria-expanded": String(S.stripOpen), on: { click: () => { S.stripOpen = !S.stripOpen; drawChrome(); } } },
@@ -827,9 +1003,38 @@ function drawChrome() {
   }
 }
 
+/* Stage 2: every screen says how old its data is. */
+function staleLine(idx) {
+  const s = A.staleNote(idx.built_at, Date.now());
+  return el("p", { class: "stale" + (s.old ? " old" : ""), "data-built": idx.built_at }, s.text);
+}
+/* Every tab's age line ages with the header, not only on redraw (Codex, 20261009-194617). */
+function ageStaleLines() {
+  document.querySelectorAll(".stale[data-built]").forEach((p) => {
+    const s = A.staleNote(p.dataset.built, Date.now());
+    p.textContent = s.text; p.className = "stale" + (s.old ? " old" : "");
+  });
+}
+function deskList(items) {
+  return el("ol", { class: "threads desk" }, items.map((d) => el("li", null,
+    el("span", { class: "t-title" }, d.title || d.slug),
+    el("span", { class: "t-meta" }, d.level ? el("span", null, d.level) : null, Number.isFinite(d.minutes) ? el("span", null, `${d.minutes} min`) : null,
+      d.where ? el("span", null, d.where === "machine" ? "at the machine" : "anywhere") : null,
+      d.added ? el("span", null, `since ${d.added}`) : null, d.source ? el("span", null, d.source) : null),
+    d.why ? el("span", { class: "why" }, d.why) : null)));
+}
 async function drawToday(main, ctx) {
   const t = A.todayBody(await src.text(ctx.idx.today));
-  main.append(el("h2", null, ctx.person === "caleb" ? "Today, Caleb" : "Today, Garrett"),
+  if (ctx.gen !== S.gen) return;
+  main.append(el("h2", null, ctx.person === "caleb" ? "Today, Caleb" : "Today, Garrett"), staleLine(ctx.idx));
+  if (ctx.idx.desk) {
+    const L = A.todayLists(ctx.idx);
+    main.append(el("h3", null, `Blockers (${L.blockers.length})`),
+      L.blockers.length ? deskList(L.blockers) : el("p", { class: "note" }, "Nothing marked as blocking."),
+      el("h3", null, `Waiting on you, oldest first (${L.waiting.length}${L.minutes ? `, about ${L.minutes} min` : ""})`),
+      L.waiting.length ? deskList(L.waiting) : el("p", { class: "note" }, "Nothing on your desk."));
+  }
+  main.append(el("h3", null, "From the agenda"),
     el("p", { class: "note" }, t.built ? `This page: ${t.built}.` : "This page has no build line."), renderMarkdown(t.body));
 }
 
@@ -843,8 +1048,10 @@ function drawInbox(main) {
   S.page = pg.page;
   const chip = (key, label) => el("button", { type: "button", class: "chip", "aria-pressed": String(S.filter === key),
     on: { click: () => { S.filter = key; S.page = 0; draw(); } } }, label);
-  main.append(el("div", { class: "filters" }, chip("all", "All"), chip("unseen", `Unseen (${S.idx.counts.unseen})`),
-    chip("needs", `Needs me (${S.idx.threads.filter((t) => t.asks_you === true).length})`),
+  main.prepend(staleLine(S.idx));
+  main.append(el("div", { class: "filters" }, chip("needs", `Needs me (${S.idx.threads.filter((t) => t.asks_you === true).length})`),
+    chip("unseen", `Unseen (${S.idx.counts.unseen})`), chip("all", "All"),
+    chip("direct", `Direct (${S.idx.threads.filter(A.isDirect).length})`),
     chip("unprocessed", `Not processed (${S.idx.counts.unprocessed})`),
     el("span", { class: "count" }, `${S.idx.counts.listed} of ${S.idx.counts.messages} listed`)));
   if (S.filter === "needs") main.append(el("p", { class: "note" }, "Messages that declare a question or decision to you. " +
@@ -853,10 +1060,14 @@ function drawInbox(main) {
   main.append(el("ol", { class: "threads" }, pg.items.map((t) => {
     const st = A.threadState(t, S.person);
     const when = t.added ? new Date(t.added).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "";
+    const cv = A.convo(t, S.person);
     return el("li", { class: st.unseen ? "unseen" : "" }, el("button", { type: "button", on: { click: () => openThread(t) } },
       el("span", { class: "t-title" }, A.title(t)),
-      el("span", { class: "t-meta" }, el("span", null, when), st.unseen ? el("span", { class: "u" }, st.seen) : null,
-        el("span", null, st.answer), t.purpose ? el("span", null, t.purpose) : null)));
+      el("span", { class: "t-meta" }, cv.who ? el("span", null, cv.who) : null,
+        cv.kinds.map((k) => el("span", { class: `kind ${k}` }, k)),
+        cv.waiting ? el("span", { class: "waiting" }, "Waiting for you") : null),
+      el("span", { class: "t-meta" }, el("span", null, when), st.unseen ? el("span", { class: "u" }, cv.replyNote || st.seen) : null,
+        el("span", null, st.answer))));
   })));
   if (pg.pages > 1) main.append(el("div", { class: "pager" },
     el("button", { type: "button", disabled: pg.page === 0, on: { click: () => { S.page--; draw(); } } }, "Newer"),
@@ -971,12 +1182,15 @@ function composer(re) {
     }
     send.disabled = false;
   } } }, "Send");
-  box.append(el("h3", null, re ? "Reply" : "New message"), ta, el("div", { class: "acts" }, to, send), out);
+  // Stage 2: quick replies fill the box; Send still sends (a canned answer is never sent by itself).
+  const quick = el("div", { class: "quick" }, A.QUICK_REPLIES.map((q) => el("button", { type: "button",
+    on: { click: () => { ta.value = q; ta.focus(); } } }, q)));
+  box.append(el("h3", null, re ? "Reply" : "New message"), quick, ta, el("div", { class: "acts" }, to, send), out);
   return box;
 }
 
 /* B-1455, step 2: the Ledger, Projects and Lanes tabs. Same rules: read-only, generated files only, text only. */
-const TAB_NAMES = { today: "Today", inbox: "Inbox", ledger: "Ledger", projects: "Projects", lanes: "Lanes" };
+const TAB_NAMES = { today: "Today", inbox: "Inbox", ledger: "Ledger", projects: "Projects", lanes: "Lanes", more: "More" };
 function backButton() {
   return el("button", { type: "button", class: "back", on: { click: () => { S.open = null; draw(); } } }, `‹ ${TAB_NAMES[S.tab] || "Back"}`);
 }
@@ -986,44 +1200,137 @@ function entryRow(e) {
     el("span", { class: "t-title" }, `${e.number} · ${A.slugWords(e.title)}`),
     el("span", { class: "t-meta" }, el("span", null, when), el("span", { class: e.status === "READY" ? "u" : "" }, A.statusWord(e.status)))));
 }
+/* Stage 2: the ledger as a timeline, newest day first, each day by project; filters by who and by project. Zeus's
+   Z entries join Fable's B entries on Caleb's side. */
 function drawLedger(main) {
-  const all = S.idx.ledger || [];
-  const shown = S.lfilter === "asked" ? all.filter((e) => e.status === "READY") : all;
-  const pg = A.paginate(shown, S.lpage);
-  S.lpage = pg.page;
+  const base = (S.idx.ledger || []).concat(S.idx.zeus ? S.idx.zeus.ledger || [] : []);
+  const all = S.lfilter === "asked" ? base.filter((e) => e.status === "READY") : base;
   const chip = (key, label) => el("button", { type: "button", class: "chip", "aria-pressed": String(S.lfilter === key),
-    on: { click: () => { S.lfilter = key; S.lpage = 0; draw(); } } }, label);
-  const who = S.person === "garrett" ? "Onyx's G entries" : "Fable's B entries";
-  main.append(el("div", { class: "filters" }, chip("all", "All"),
-    chip("asked", `Asked you (${all.filter((e) => e.status === "READY").length})`),
-    el("span", { class: "count" }, `newest ${all.length}`)));
-  main.append(el("p", { class: "note" }, S.lfilter === "asked"
-    ? "Entries that asked you something when they were written. Whether each is still open is on Today."
-    : `${who}, newest first.`));
-  if (!pg.items.length) main.append(el("p", { class: "note" }, "Nothing here."));
-  main.append(el("ol", { class: "threads" }, pg.items.map(entryRow)));
-  if (pg.pages > 1) main.append(el("div", { class: "pager" },
-    el("button", { type: "button", disabled: pg.page === 0, on: { click: () => { S.lpage--; draw(); } } }, "Newer"),
-    `Page ${pg.page + 1} of ${pg.pages}`,
-    el("button", { type: "button", disabled: pg.page >= pg.pages - 1, on: { click: () => { S.lpage++; draw(); } } }, "Older")));
+    on: { click: () => { S.lfilter = key; draw(); } } }, label);
+  const whoChip = (key, label) => el("button", { type: "button", class: "chip", "aria-pressed": String(S.lwho === key),
+    on: { click: () => { S.lwho = key; draw(); } } }, label);
+  const projects = [...new Set(base.flatMap((e) => e.projects || []))].sort();
+  const sel = el("select", { class: "filter", "aria-label": "Project", on: { change: (ev) => { S.lproj = ev.target.value; draw(); } } },
+    el("option", { value: "all" }, "All projects"), projects.map((p) => el("option", { value: p }, p)));
+  sel.value = projects.includes(S.lproj) ? S.lproj : "all";
+  main.append(staleLine(S.idx));
+  main.append(el("div", { class: "filters" }, chip("all", "All"), chip("asked", `Asked you (${base.filter((e) => e.status === "READY").length})`),
+    S.person === "garrett" ? null : [whoChip("all", "Everyone"), whoChip("fable", "Fable"), whoChip("zeus", "Zeus")], sel));
+  if (S.lfilter === "asked") main.append(el("p", { class: "note" }, "Entries that asked you something when they were written. Whether each is still open is on Today."));
+  const days = A.ledgerTimeline(all, { who: S.lwho, project: sel.value });
+  if (!days.length) main.append(el("p", { class: "note" }, "Nothing here."));
+  for (const d of days) {
+    const when = isNaN(Date.parse(d.day)) ? d.day : new Date(d.day + "T12:00").toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+    main.append(el("div", { class: "day" }, when));
+    for (const g of d.projects) main.append(el("div", { class: "proj" }, g.project), el("ol", { class: "threads" }, g.items.map(entryRow)));
+  }
 }
 function drawProjects(main) {
   const ps = S.idx.projects || [];
-  main.append(el("h2", null, "Projects"), el("p", { class: "note" }, "Each project, its state, and its newest entries."));
+  main.append(el("h2", null, "Projects"), staleLine(S.idx),
+    el("p", { class: "note" }, "Each project, what's new since you last caught up, and its newest entries. Opening a project never moves your checkpoint; only \"Caught up\" does."));
   if (!ps.length) main.append(el("p", { class: "note" }, "No projects in this index."));
   for (const p of ps) {
     // latest_rows resolve over every entry, not just the capped ledger (Codex, 20261009-085407).
     const rows = p.latest_rows || (p.latest || []).map((num) => (S.idx.ledger || []).find((e) => e.number === num) || { number: num });
-    main.append(el("section", { class: "project" },
-      el("h3", null, p.name || p.id, " ", el("span", { class: "pill" }, p.state || "?")),
+    // A checkpoint saved from this phone counts until the index catches up; the newer of the two always wins, so a
+    // checkpoint never moves backwards (Codex, 20261009-194617). The rows are the newest five of everything since,
+    // so when all five are newer than the local checkpoint there may be more: "5+", never an undercount.
+    const local = S.caught[p.id] && (!p.caught_up_through || S.caught[p.id] > p.caught_up_through) ? S.caught[p.id] : null;
+    const allRows = p.since_rows || [];
+    const sinceRows = local ? allRows.filter((e) => e.number > local) : allRows;
+    const total = p.since_count ?? allRows.length;
+    const more = local && sinceRows.length === allRows.length && total > allRows.length;
+    const sinceCount = local ? sinceRows.length : total;
+    const through = local || p.caught_up_through;
+    const sec = el("section", { class: "project" },
+      el("h3", null, p.name || p.id, " ", el("span", { class: "pill" }, p.state || "?"),
+        sinceCount ? el("span", { class: "pill u" }, `${sinceCount}${more ? "+" : ""} new`) : null),
       p.what ? el("p", { class: "note" }, p.what) : null,
-      rows.length ? el("ol", { class: "threads" }, rows.map((e) => e.path ? entryRow(e)
-        : el("li", null, el("span", { class: "note" }, `${e.number} (older than the ledger this index carries)`)))) : null));
+      el("p", { class: "note" }, (through ? `Since you last caught up (through ${through}): ${sinceCount ? `${sinceCount}${more ? "+" : ""} new` : "nothing new"}.`
+        : `You haven't caught up on this yet: ${sinceCount} ${sinceCount === 1 ? "entry" : "entries"}.`)
+        + (sinceCount > sinceRows.length || more ? ` Showing the newest ${sinceRows.length}.` : "")),
+      sinceRows.length ? el("ol", { class: "threads" }, sinceRows.map(entryRow)) : null);
+    if (sinceRows.length && canWrite()) {
+      const note = el("p", { class: "note" });
+      const b = el("button", { type: "button", class: "act", on: { click: () => caughtUp(p, sinceRows[0].number, b, note) } }, "Caught up");
+      sec.append(el("div", { class: "acts" }, b), note);
+    }
+    if (!sinceRows.length && rows.length) sec.append(el("h4", null, "Newest entries"),
+      el("ol", { class: "threads" }, rows.map((e) => e.path ? entryRow(e)
+        : el("li", null, el("span", { class: "note" }, `${e.number} (older than the ledger this index carries)`)))));
+    main.append(sec);
+  }
+}
+/* "Got it" and "Caught up": one event file each, retried exactly as sent if the answer is lost (same path, same
+   text), recorded locally only on GitHub's yes, like a seen receipt. */
+async function sendEvent(pkey, build, button, note, done) {
+  button.disabled = true; note.textContent = "Recording…";
+  try {
+    const ev = S.pending[pkey] || build();
+    await src.create(ev.path, ev.text, ev.message).catch((e) => { if (e.pending) S.pending[pkey] = ev; throw e; });
+    delete S.pending[pkey];
+    done(ev);
+  } catch (e) {
+    button.disabled = false;
+    note.replaceChildren(errorBox(e, S.pending[pkey] ? "Tap again to retry; it resends the same file, so it can't land twice." : "Nothing was recorded."));
+  }
+}
+function gotIt(a, button, note) {
+  return sendEvent(`ack:${a.alert_id}`, () => ({ ...A.alertAck(S.person, a, new Date(), randHex()), message: `Caleb: got it, ${a.alert_id} (phone)` }),
+    button, note, () => { S.acked[a.alert_id] = true; drawChrome(); });
+}
+function caughtUp(p, through, button, note) {
+  const pin = src.pinned && src.pinned();
+  return sendEvent(`caught:${p.id}:${through}`, () => ({ ...A.caughtUpEvent(S.person, p.id, through, pin ? pin.sha : "", new Date(), randHex()),
+    message: `Caleb: caught up on ${p.id} through ${through} (phone)` }),
+    button, note, () => { S.caught[p.id] = through; draw(); });
+}
+/* Stage 2: the More tab - Quick-links (MAP.md, a copy button per path), the Lingo glossary, Settings. */
+async function drawMore(main, ctx) {
+  const pick = (key, label) => el("button", { type: "button", "aria-pressed": String(S.more === key), on: { click: () => { S.more = key; draw(); } } }, label);
+  main.append(el("h2", null, "More"), el("div", { class: "moremenu" }, pick("links", "Quick links"), pick("lingo", "Lingo"), pick("settings", "Settings")));
+  if (S.more === "settings") {
+    const theme = el("select", { class: "filter", "aria-label": "Theme", on: { change: (ev) => {
+      const v = ev.target.value;
+      if (v === "system") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = v;
+      try { if (v === "system") localStorage.removeItem("relay.theme"); else localStorage.setItem("relay.theme", v); } catch (e) {}
+    } } }, el("option", { value: "system" }, "Match the phone"), el("option", { value: "light" }, "Light"), el("option", { value: "dark" }, "Dark"));
+    theme.value = document.documentElement.dataset.theme || "system";
+    const p = src.pinned ? src.pinned() : null;
+    main.append(el("dl", { class: "fields" },
+      el("dt", null, "you"), el("dd", null, S.me ? `${S.me.login} (${S.me.person})` : S.person),
+      el("dt", null, "source"), el("dd", null, src.kind === "github" ? `GitHub, commit ${p ? p.sha.slice(0, 8) : "?"}` : "working tree (preview)"),
+      el("dt", null, "writes"), el("dd", null, canWrite()
+        ? "this account may write from the phone; the key itself also needs Contents: Read and write"
+        : "read-only here"),
+      el("dt", null, "index"), el("dd", null, A.staleNote(ctx.idx.built_at, Date.now()).text)),
+      el("p", null, "Theme ", theme),
+      el("p", { class: "note" }, "Your key is held in this page's memory only. \"Forget key\" at the top drops it."));
+    return;
+  }
+  const path = S.more === "lingo" ? "docs/core/protocols-and-lingo.md" : "MAP.md";
+  let text;
+  try { text = await src.text(path); } catch (e) { if (ctx.gen === S.gen) main.append(errorBox(e)); return; }
+  if (ctx.gen !== S.gen) return;
+  if (S.more === "lingo") { main.append(el("p", { class: "note" }, el("code", null, path)), renderMarkdown(text)); return; }
+  main.append(el("p", { class: "note" }, "Where things are, from MAP.md. Copy a path to paste it to Wren or into a message."));
+  let section = null;
+  for (const row of A.mapLinks(text)) {
+    if (row.section !== section) { section = row.section; main.append(el("h3", null, section)); }
+    main.append(el("p", { class: "note" }, row.question), el("ul", { class: "links" }, row.links.map((l) => {
+      const b = el("button", { type: "button", on: { click: async () => {
+        try { await navigator.clipboard.writeText(l.path); b.textContent = "Copied"; }
+        catch (e) { b.textContent = "Select it"; window.getSelection().selectAllChildren(code); }
+      } } }, "Copy");
+      const code = el("code", null, l.path);
+      return el("li", null, el("span", null, l.name !== l.path ? `${l.name} · ` : "", code), b);
+    })));
   }
 }
 function drawLanes(main) {
   const z = S.idx.zeus;
-  main.append(el("h2", null, "Zeus"), el("p", { class: "note" },
+  main.append(el("h2", null, "Zeus"), staleLine(S.idx), el("p", { class: "note" },
     "Your Codex lane. Messages waiting for Zeus, and Zeus's answers (Z entries). Garrett's lane is his own and isn't shown here."));
   if (z.problem) main.append(errorBox(new A.AppError("Zeus's lane has a problem", z.problem)));
   main.append(el("h3", null, `Waiting for Zeus (${z.waiting.length})`));
@@ -1073,6 +1380,7 @@ async function draw() {
     else if (ctx.tab === "ledger") drawLedger(out);
     else if (ctx.tab === "projects") drawProjects(out);
     else if (ctx.tab === "lanes" && ctx.idx.zeus) drawLanes(out);
+    else if (ctx.tab === "more") await drawMore(out, ctx);
     else drawInbox(out);
   } catch (e) { out.replaceChildren(errorBox(e)); }
   if (ctx.gen !== S.gen) return;
@@ -1105,6 +1413,7 @@ $("#forget").addEventListener("click", () => {
   connGen++;                                       // a connection still being made never completes after this
   if (src && src.close) src.close();
   src = null; S.idx = null; S.error = null; S.open = null; S.scroll = {}; S.loadGen++; S.me = null; S.recorded = {}; S.pending = {};
+  S.acked = {}; S.caught = {};
   drawChrome(); drawKeyScreen();
 });
 (async () => { if (await loadIndex()) draw(); })();
