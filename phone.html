@@ -125,6 +125,13 @@ nav.tabs .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin
 .kind { font-size: 0.7rem; padding: 0 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
 .kind.direct { border-color: var(--care); color: var(--care); }
 .kind.decision, .kind.question { border-color: var(--accent); color: var(--accent); }
+.kind.intent-instruction { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.kind.intent-sketch { border-style: dashed; }
+.intent { margin-bottom: 2px; }
+.intent-means { margin-top: 0; }
+.next { margin: 6px 0; padding: 6px 10px; border-left: 3px solid var(--accent); }
+.next.none { border-left-color: var(--line); }
+.next .next-title { font-weight: 600; }
 .waiting { color: var(--alert); font-weight: 650; }
 .day { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 16px 0 2px;
   border-bottom: 1px solid var(--line); padding-bottom: 2px; }
@@ -436,11 +443,50 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
       if (e.projects !== undefined && !(Array.isArray(e.projects) && e.projects.every(str)))
         throw new AppError("A ledger row's projects in the index are malformed", person);
     for (const t of idx.threads)
-      if (!optStr(t.sender) || !optStr(t.recipient) || !optStr(t.kind))
+      if (!optStr(t.sender) || !optStr(t.recipient) || !optStr(t.kind)
+          || !(t.intent == null || Object.prototype.hasOwnProperty.call(INTENTS, t.intent)))
         throw new AppError("A thread's labels in the index are malformed", person);
     for (const d of idx.desk || [])
-      if (!optStr(d.why) || !optStr(d.added) || (d.minutes != null && !Number.isFinite(d.minutes)))
+      if (!optStr(d.why) || !optStr(d.added) || (d.minutes != null && !Number.isFinite(d.minutes))
+          || !optStr(d.rank_note) || !optStr(d.rank_set) || !optStr(d.needs))
         throw new AppError("A desk item in the index is malformed", person);
+    // Stage 3: each project's next decision, the desk items no project matched, and Zeus's lane intents.
+    const num = (v) => /^B-\d{4}$/.test(v || "");
+    const cnt = (v) => Number.isInteger(v) && v >= 0;
+    const bool = (v) => typeof v === "boolean";
+    for (const p of idx.projects || []) {
+      const n = p.next;
+      if (n === undefined || n === null) continue;
+      const k = n.pick;
+      const pickOk = k === null || (k && typeof k === "object" && bool(k.is_decision) && (
+        (k.source === "desk" && str(k.slug) && Array.isArray(k.matched) && k.matched.length > 0 && k.matched.every(num))
+        || (k.source === "ready" && num(k.number) && str(k.path) && optStr(k.date) && optStr(k.blocked_on) && optStr(k.title))));
+      // Counts, lists and the pick have to agree, so a contradictory card is an error, never drawn (Codex,
+      // 20261009-201650): every linked desk item is listed; READY lists the oldest ten of its count.
+      const lists = Array.isArray(n.desk_items) && n.desk_items.every((d) => d && str(d.slug) && Array.isArray(d.matched)
+                      && d.matched.length > 0 && d.matched.every(num))
+                    && Array.isArray(n.ready_items) && n.ready_items.every((r) => r && num(r.number) && str(r.path));
+      const agree = lists && cnt(n.desk_count) && n.desk_items.length === n.desk_count
+        && (n.ready_count === null ? n.ready_items.length === 0 : cnt(n.ready_count) && n.ready_items.length === Math.min(n.ready_count, 10))
+        && optStr(n.ready_problem) && optStr(n.desk_problem) && (n.ready_count === null) === !!n.ready_problem;
+      const stateOk = !lists ? false : n.state === "ok" ? !!k && (k.source === "desk"
+            ? n.desk_items.some((d) => d.slug === k.slug)
+            : n.desk_count === 0 && n.ready_count !== null && n.ready_count > 0)
+        : n.state === "none" ? !k && n.desk_count === 0 && n.ready_count === 0 && !n.desk_problem
+        : n.state === "unavailable" ? !k && n.desk_count === 0 && (n.ready_count === null || !!n.desk_problem) && !(n.ready_count > 0)
+        : false;
+      if (!n || typeof n !== "object" || !pickOk || !agree || !stateOk)
+        throw new AppError("A project's next decision in the index is malformed", person);
+    }
+    if (idx.desk_unmatched !== undefined && !(Array.isArray(idx.desk_unmatched)
+        && idx.desk_unmatched.every((d) => d && (str(d.slug) || str(d.title)) && optStr(d.source))))
+      throw new AppError("The index's unmatched desk items are malformed", person);
+    if (idx.zeus && idx.zeus.intents !== undefined) {
+      const z = idx.zeus.intents;
+      if (!z || typeof z !== "object" || Array.isArray(z)
+          || !Object.values(z).every((v) => typeof v === "string" && Object.prototype.hasOwnProperty.call(INTENTS, v)))
+        throw new AppError("The index's Zeus lane is malformed", person);
+    }
     return idx;
   }
 
@@ -666,13 +712,35 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
     return hit ? hit[0] : null;
   }
 
-  function phoneMessage(to, re, body, now, rand) {
+  /* Stage 3: what the sender means by a message, chosen on the composer (DESIGN.md: Message is the default, Sketch and
+     Instruction explicit; open question 9). It travels as one `intent:` header line. An instruction states what Caleb
+     wants; it never approves anything (B8): a go is still typed in session. */
+  const INTENTS = {
+    message: { word: "Message", means: "An ordinary message." },
+    sketch: { word: "Sketch", means: "A loose idea: the shape, not a spec. Nothing is built from it as written." },
+    instruction: { word: "Instruction", means: "What you want done. It states intent; it never approves anything. A go is still typed in session." },
+  };
+  /* The same meaning in the message itself, for an agent that reads only the body (Codex, 20261009-200350). It
+     explains; it enforces nothing, and it authenticates nobody. */
+  const INTENT_NOTICE = {
+    sketch: "(Sketch, sent from Caleb's phone: the shape of an idea, not a spec.)",
+    instruction: "(Instruction, sent from Caleb's phone: it states work he wants; it is not approval to execute. A go is typed in session.)",
+  };
+  /* A line that starts like an inbox stamp would make the inbox count the message as already answered: both counters
+     read a stamp at the start of any of a message's first 8 lines (inbox/check-uningested.sh, relay.caleb_processed).
+     Refused anywhere in the body, visibly, with the draft kept (Codex, 20261009-200350). */
+  const STAMP_LINE = /^\s*\[\s*(ingested as|answered in)\b/im;
+  function phoneMessage(to, re, body, now, rand, intent) {
+    const want = intent === undefined ? "message" : intent;
+    if (!Object.prototype.hasOwnProperty.call(INTENTS, want)) throw new AppError("Unknown kind of message", String(want));
     const text = String(body || "").replace(/\r\n/g, "\n").trim();
     if (!text) throw new AppError("The message is empty", "write something first");
     const key = looksLikeKey(text);
     if (key) throw new AppError("That looks like a key or password", `it matches the shape of a ${key}. Take it out: ` +
       "anything sent stays in the repo's history for good");
     if (text.length > 8000) throw new AppError("The message is too long", "keep it under 8,000 characters");
+    if (STAMP_LINE.test(text)) throw new AppError("A line starts like an inbox stamp", "a line beginning “[ingested as” or " +
+      "“[answered in” would make the inbox treat this as already answered. Reword that line; your text is kept");
     if (!["fable", "zeus"].includes(to)) throw new AppError("Unknown recipient", to);
     const cleanRe = String(re || "none").replace(/[\r\n]+/g, " ").slice(0, 200);
     const p = (n) => String(n).padStart(2, "0");
@@ -680,7 +748,8 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
     const tm = `${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`;
     const dir = to === "zeus" ? "inbox/lanes/zeus/messages" : "inbox/messages";
     return { path: `${dir}/${day}-phone-${tm}-${rand}.md`,
-             text: `from: Caleb (phone)\nto: ${to === "zeus" ? "Zeus" : "Fable"}\nre: ${cleanRe}\n\n${text}\n` };
+             text: `from: Caleb (phone)\nto: ${to === "zeus" ? "Zeus" : "Fable"}\nre: ${cleanRe}\nintent: ${want}\n\n`
+               + (INTENT_NOTICE[want] ? `${INTENT_NOTICE[want]}\n\n` : "") + `${text}\n` };
   }
 
   /* Does a receipt this phone just wrote still cover the thread as the index now shows it? Only if it pinned the
@@ -733,6 +802,9 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
     return {
       who: from || to ? `${from || "?"} → ${to || "?"}` : null,
       kinds: [t.kind === "direct" ? "direct" : null, KIND_WORDS.includes(t.purpose) ? t.purpose : null].filter(Boolean),
+      // Stage 3: only the two that change how a message is read get a chip; a plain Message needs none. Null intent
+      // (free text, older phone messages) shows nothing, never a guess.
+      intent: t.intent === "sketch" || t.intent === "instruction" ? INTENTS[t.intent].word : null,
       waiting: t.asks_you === true && !t.processed_by,
       replyNote: t.unseen_reason === "new reply" ? `${agent} replied · you haven't seen this reply` : null,
     };
@@ -798,6 +870,44 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
     return out;
   }
 
+  /* Stage 3: a project's next decision, in words, from the index only (make_index.py next_decisions; Codex,
+     20261009-200350). Two sources, labelled as what they are: a desk item (associated with the project through the
+     B entries it cites, with the desk's own note, which can restrict or overrule its title), or else the oldest READY
+     entry still open by WAITING's rule. "Next decision" only when it is one; otherwise "Next waiting on you". An
+     absent field, Garrett's view, an unreadable waiting list and a checked empty are four different sentences. */
+  function nextView(p, idx, person) {
+    const n = p.next;
+    if (n === undefined || n === null)
+      return { state: "absent", text: person === "garrett" ? "Next decision: not built for Garrett's view yet."
+        : "Next decision: not in this index yet (it predates it). Refresh after the next inbox check." };
+    const counts = `Linked desk items: ${n.desk_count}${n.desk_problem ? " (desk not fully read)" : ""} · Still waiting (READY): ${n.ready_count === null ? "can't tell" : n.ready_count}`;
+    const readyNote = [n.ready_count === null ? `The waiting list couldn't be read: ${n.ready_problem || "no reason given"}.` : null,
+                       n.desk_problem ? `The desk couldn't be fully read: ${n.desk_problem}.` : null].filter(Boolean).join(" ") || null;
+    if (n.state === "unavailable")
+      return { state: "unavailable", text: "Can't tell what's next here: nothing found in what could be read, and a source couldn't be read.",
+               detail: readyNote, counts };
+    if (n.state === "none")
+      return { state: "none", text: "Nothing on the desk or waiting for you here.",
+               detail: "Checked the desk and every READY entry still open by WAITING's rule.", counts };
+    const k = n.pick;
+    const heading = k.is_decision ? "Next decision" : "Next waiting on you";
+    if (k.source === "desk") {
+      const d = (idx.desk || []).find((x) => x.slug === k.slug);
+      if (!d) return { state: "problem", text: `Next: desk item ${k.slug}, which isn't in this index's desk list.`, counts };
+      return { state: "ok", heading, source: "desk", title: d.title || d.slug,
+               meta: ["from the desk", Number.isFinite(d.minutes) ? `${d.minutes} min` : null, d.added ? `added ${d.added}` : null,
+                      d.where === "machine" ? "at the machine" : null, d.blocking ? "blocking" : null].filter(Boolean).join(" · "),
+               why: d.why || null,
+               note: d.rank_note ? `Desk note${d.rank_set ? ` (${d.rank_set})` : ""}: ${d.rank_note}` : null,
+               via: `Linked to this project through ${k.matched.join(", ")}`, detail: readyNote, counts, slug: d.slug };
+    }
+    return { state: "ok", heading, source: "ready", title: `${k.number} · ${k.title || ""}`.trim(),
+             meta: [k.date ? `asked ${k.date}` : null, k.blocked_on ? `waiting on: ${k.blocked_on}` : "reason not recorded"].filter(Boolean).join(" · "),
+             why: null, note: (k.is_decision ? "The oldest READY entry here waiting on your judgement" : "The oldest READY entry here")
+               + " that's still open by WAITING's rule. It asked you when written; it may be settled and not yet reconciled.",
+             via: null, detail: readyNote, counts, entry: { number: k.number, path: k.path, status: "READY", title: k.title || "" } };
+  }
+
   /* Short canned answers: they fill the reply box, and you still tap Send (never sent by themselves). */
   const QUICK_REPLIES = ["Got it.", "Later.", "Yes, go ahead (as a message)."];
 
@@ -809,10 +919,10 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
 
   const api = { SCHEMA, PEOPLE, PAGE_SIZE, OLD_AFTER_MIN, AppError, LocalSource, GitHubSource, checkIndex, freshness, sortThreads,
                 filterThreads, paginate, threadState, title, careNow, splitMessage, inline, markdownBlocks, todayBody,
-                entryBody, statusWord, slugWords, sha256Hex, messageSha, receipt, phoneMessage, PEOPLE_BY_GITHUB_ID, WRITERS, locallySeen,
+                entryBody, statusWord, slugWords, sha256Hex, messageSha, receipt, phoneMessage, INTENTS, INTENT_NOTICE, PEOPLE_BY_GITHUB_ID, WRITERS, locallySeen,
                 TOKEN_PATTERNS, looksLikeKey,
                 GITHUB_WRITABLE, GITHUB_READABLE_FILES, EVENT_RULES,
-                todayLists, convo, isDirect, whoOf, ledgerTimeline, alertAck, caughtUpEvent, mapLinks, QUICK_REPLIES, staleNote };
+                todayLists, convo, isDirect, whoOf, ledgerTimeline, alertAck, caughtUpEvent, mapLinks, QUICK_REPLIES, staleNote, nextView };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.PhoneApp = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);
@@ -1065,6 +1175,7 @@ function drawInbox(main) {
       el("span", { class: "t-title" }, A.title(t)),
       el("span", { class: "t-meta" }, cv.who ? el("span", null, cv.who) : null,
         cv.kinds.map((k) => el("span", { class: `kind ${k}` }, k)),
+        cv.intent ? el("span", { class: `kind intent-${t.intent}` }, cv.intent) : null,
         cv.waiting ? el("span", { class: "waiting" }, "Waiting for you") : null),
       el("span", { class: "t-meta" }, el("span", null, when), st.unseen ? el("span", { class: "u" }, cv.replyNote || st.seen) : null,
         el("span", null, st.answer))));
@@ -1081,7 +1192,9 @@ async function drawThread(main, ctx) {
   main.append(el("button", { type: "button", class: "back", on: { click: () => { S.open = null; draw(); } } }, "‹ Inbox"));
   main.append(el("h2", null, A.title(t)));
   main.append(el("div", { class: "state" }, el("span", { class: "pill" + (st.unseen ? " u" : "") }, st.seen),
-    el("span", { class: "pill" }, st.answer), el("span", { class: "pill" }, t.format || "message")));
+    el("span", { class: "pill" }, st.answer), el("span", { class: "pill" }, t.format || "message"),
+    A.convo(t, S.person).intent ? el("span", { class: `kind intent-${t.intent}` }, A.convo(t, S.person).intent) : null));
+  if (t.intent && t.intent !== "message") main.append(el("p", { class: "note" }, A.INTENTS[t.intent].means));
   const text = await src.text(t.path);
   if (ctx.gen !== S.gen) return;
   const shownMsgSha = A.messageSha(text);            // the fingerprint of exactly what's on screen (step 4)
@@ -1163,20 +1276,33 @@ function composer(re) {
   // recipient reuse its path, so a late-landing first attempt can never become a second message.
   const pkey = `message:${re || "new"}`;
   const p0 = S.pending[pkey];
+  // Stage 3: Message (the default), Sketch or Instruction, so a loose idea is never read as an order (DESIGN.md). It
+  // travels as the message's intent line; an instruction states intent and never approves anything (B8).
+  let intent = p0 && p0.intent ? p0.intent : "message";
+  const means = el("p", { class: "note intent-means" });
+  const kinds = Object.keys(A.INTENTS).map((k) => el("button", { type: "button", class: "chip", "data-intent": k,
+    on: { click: () => { intent = k; showIntent(); } } }, A.INTENTS[k].word));
+  function showIntent() {
+    for (const b of kinds) b.setAttribute("aria-pressed", String(b.getAttribute("data-intent") === intent));
+    means.textContent = A.INTENTS[intent].means;
+  }
+  showIntent();
   if (p0) { ta.value = p0.words; to.value = p0.to; out.textContent = "An earlier send may not have arrived. Tap Send to retry it (same file, so never twice)."; }
   const send = el("button", { type: "button", class: "act", on: { click: async () => {
     send.disabled = true; out.textContent = "Sending…";
     try {
-      const fresh = A.phoneMessage(to.value, re, ta.value, new Date(), randHex());
+      const fresh = A.phoneMessage(to.value, re, ta.value, new Date(), randHex(), intent);
       const p = S.pending[pkey];
-      const msg = p && p.text === fresh.text ? p : { ...fresh, words: ta.value, to: to.value };
+      const msg = p && p.text === fresh.text ? p : { ...fresh, words: ta.value, to: to.value, intent };
       await src.create(msg.path, msg.text, `Caleb (phone) to ${to.value === "zeus" ? "Zeus" : "Fable"}`).catch((e) => {
         if (e.pending) S.pending[pkey] = msg;
         throw e;
       });
       delete S.pending[pkey];
       ta.value = "";
-      out.textContent = `Sent to ${to.value === "zeus" ? "Zeus" : "Fable"} (${msg.path}). It's a message, like one through Wren: answered on the next inbox check.`;
+      out.textContent = `Sent to ${to.value === "zeus" ? "Zeus" : "Fable"} as ${A.INTENTS[msg.intent || "message"].word.toLowerCase()} (${msg.path}). `
+        + "It's a message, like one through Wren: answered on the next inbox check, and a request, never a go.";
+      intent = "message"; showIntent();
     } catch (e) {
       out.replaceChildren(errorBox(e, S.pending[pkey] ? "Tap Send again to retry; it reuses the same file, so it can't arrive twice." : "Nothing was sent."));
     }
@@ -1185,7 +1311,9 @@ function composer(re) {
   // Stage 2: quick replies fill the box; Send still sends (a canned answer is never sent by itself).
   const quick = el("div", { class: "quick" }, A.QUICK_REPLIES.map((q) => el("button", { type: "button",
     on: { click: () => { ta.value = q; ta.focus(); } } }, q)));
-  box.append(el("h3", null, re ? "Reply" : "New message"), quick, ta, el("div", { class: "acts" }, to, send), out);
+  box.append(el("h3", null, re ? "Reply" : "New message"),
+    el("div", { class: "filters intent", role: "group", "aria-label": "What this message is" }, kinds), means,
+    quick, ta, el("div", { class: "acts" }, to, send), out);
   return box;
 }
 
@@ -1228,7 +1356,7 @@ function drawLedger(main) {
 function drawProjects(main) {
   const ps = S.idx.projects || [];
   main.append(el("h2", null, "Projects"), staleLine(S.idx),
-    el("p", { class: "note" }, "Each project, what's new since you last caught up, and its newest entries. Opening a project never moves your checkpoint; only \"Caught up\" does."));
+    el("p", { class: "note" }, "Each project: its next decision, what's new since you last caught up, and its newest entries. Opening a project never moves your checkpoint; only \"Caught up\" does."));
   if (!ps.length) main.append(el("p", { class: "note" }, "No projects in this index."));
   for (const p of ps) {
     // latest_rows resolve over every entry, not just the capped ledger (Codex, 20261009-085407).
@@ -1247,6 +1375,7 @@ function drawProjects(main) {
       el("h3", null, p.name || p.id, " ", el("span", { class: "pill" }, p.state || "?"),
         sinceCount ? el("span", { class: "pill u" }, `${sinceCount}${more ? "+" : ""} new`) : null),
       p.what ? el("p", { class: "note" }, p.what) : null,
+      nextBlock(p),
       el("p", { class: "note" }, (through ? `Since you last caught up (through ${through}): ${sinceCount ? `${sinceCount}${more ? "+" : ""} new` : "nothing new"}.`
         : `You haven't caught up on this yet: ${sinceCount} ${sinceCount === 1 ? "entry" : "entries"}.`)
         + (sinceCount > sinceRows.length || more ? ` Showing the newest ${sinceRows.length}.` : "")),
@@ -1261,6 +1390,38 @@ function drawProjects(main) {
         : el("li", null, el("span", { class: "note" }, `${e.number} (older than the ledger this index carries)`)))));
     main.append(sec);
   }
+  // Stage 3: a desk item no project matched is listed here, never silently absent from every project.
+  const um = S.idx.desk_unmatched || [];
+  if (um.length) main.append(el("section", { class: "project" }, el("h3", null, `Desk items with no project match (${um.length})`),
+    el("p", { class: "note" }, "None of the entries each cites is tagged to a project. They're all on Today."),
+    el("ul", null, um.map((d) => el("li", null, d.title || d.slug, d.source ? el("span", { class: "note" }, ` (cites ${d.source})`) : null)))));
+}
+/* Stage 3: a project's next decision (A.nextView), with where it came from and what else is waiting. Every record
+   behind the counts is one tap away: desk items by name (they're on Today), READY entries open as entries. */
+function nextBlock(p) {
+  const v = A.nextView(p, S.idx, S.person);
+  if (v.state !== "ok") return el("div", { class: "next none" }, el("p", { class: "note" }, v.text),
+    v.detail ? el("p", { class: "note" }, v.detail) : null, v.counts ? el("p", { class: "note" }, v.counts) : null);
+  const title = v.entry ? el("button", { type: "button", class: "back", on: { click: () => openEntry(v.entry) } }, `${v.title} ›`)
+    : el("span", { class: "next-title" }, v.title);
+  const n = p.next;
+  const more = el("details", null, el("summary", null, "Everything here"),
+    // Every linked desk item, each with what qualifies it: decide or apply, blocking, minutes, and the desk's own note
+    // (Codex, 20261009-201650). The items themselves are on Today.
+    n.desk_items.length ? [el("h4", null, `Linked desk items (${n.desk_count}; all on Today)`), el("ul", null, n.desk_items.map((d) => {
+      const row = (S.idx.desk || []).find((x) => x.slug === d.slug);
+      const meta = [d.is_decision ? "decide" : (row && row.kind) || null, d.blocking ? "blocking" : null,
+                    row && Number.isFinite(row.minutes) ? `${row.minutes} min` : null, `via ${d.matched.join(", ")}`].filter(Boolean).join(" · ");
+      return el("li", null, row ? row.title || row.slug : `${d.slug} (not in this index's desk)`, el("span", { class: "note" }, ` · ${meta}`),
+        row && row.rank_note ? el("div", { class: "note" }, `Desk note${row.rank_set ? ` (${row.rank_set})` : ""}: ${row.rank_note}`) : null);
+    }))] : null,
+    n.ready_items.length ? [el("h4", null, `Still waiting, oldest first (${n.ready_count})`), el("ol", { class: "threads" },
+      n.ready_items.map((r) => entryRow({ number: r.number, path: r.path, status: "READY", title: r.title, at: r.date ? `${r.date}T12:00` : "" })))] : null,
+    (n.ready_count || 0) > n.ready_items.length ? el("p", { class: "note" }, `Showing the oldest ${n.ready_items.length}; the full list is inbox/WAITING.md.`) : null);
+  return el("div", { class: "next" }, el("h4", null, v.heading), el("p", null, title),
+    el("p", { class: "note" }, v.meta), v.why ? el("p", { class: "note" }, v.why) : null,
+    v.note ? el("p", { class: "note" }, v.note) : null, v.via ? el("p", { class: "note" }, v.via) : null,
+    v.detail ? el("p", { class: "note" }, v.detail) : null, el("p", { class: "note" }, v.counts), more);
 }
 /* "Got it" and "Caught up": one event file each, retried exactly as sent if the answer is lost (same path, same
    text), recorded locally only on GitHub's yes, like a seen receipt. */
@@ -1337,10 +1498,16 @@ function drawLanes(main) {
   if (!z.waiting.length) main.append(el("p", { class: "note" }, "Nothing waiting."));
   else main.append(el("ol", { class: "threads" }, z.waiting.map((name) => el("li", null,
     el("button", { type: "button", on: { click: () => { S.scroll[`${S.person}/${S.tab}`] = $("#main").scrollTop; S.open = { laneMessage: name }; draw(); } } },
-      el("span", { class: "t-title" }, A.slugWords(name.replace(/\.md$/, ""))), el("span", { class: "t-meta" }, "waiting for Zeus"))))));
+      el("span", { class: "t-title" }, A.slugWords(name.replace(/\.md$/, ""))), el("span", { class: "t-meta" }, "waiting for Zeus",
+        laneIntent(name) ? el("span", { class: `kind intent-${laneIntent(name)}` }, A.INTENTS[laneIntent(name)].word) : null))))));
   main.append(el("h3", null, `Zeus's answers (${z.ledger.length})`));
   if (!z.ledger.length) main.append(el("p", { class: "note" }, "None yet."));
   main.append(el("ol", { class: "threads" }, z.ledger.map(entryRow)));
+}
+/* Stage 3: a waiting Zeus message's intent, by the index's display-only map (Sketch or Instruction only). */
+function laneIntent(name) {
+  const it = S.idx && S.idx.zeus && S.idx.zeus.intents ? S.idx.zeus.intents[name] : null;
+  return it === "sketch" || it === "instruction" ? it : null;
 }
 function openEntry(e) { S.scroll[`${S.person}/${S.tab}`] = $("#main").scrollTop; S.open = { entry: e }; draw(); }
 async function drawEntry(main, ctx) {
@@ -1357,6 +1524,10 @@ async function drawLaneMessage(main, ctx) {
   const name = ctx.open.laneMessage;
   const path = `inbox/lanes/zeus/messages/${name}`;
   main.append(backButton(), el("h2", null, A.slugWords(name.replace(/\.md$/, ""))));
+  // The chip comes from the index (message.py's strict rule), never from this page's loose field splitter.
+  const li = laneIntent(name);
+  if (li) main.append(el("div", { class: "state" }, el("span", { class: `kind intent-${li}` }, A.INTENTS[li].word)),
+    el("p", { class: "note" }, A.INTENTS[li].means));
   const text = await src.text(path);
   if (ctx.gen !== S.gen) return;
   const m = A.splitMessage(text);
