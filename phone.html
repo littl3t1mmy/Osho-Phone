@@ -199,11 +199,18 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
     constructor(what, detail) { super(what); this.detail = detail || ""; }
   }
 
+  /* What either reader may ask for (B-1485): every "/"-separated part non-empty, not starting with a dot, with no "..",
+     and none of \ % or a control character (DEL included): the same characters allowedPath allows, so a real name with
+     a space or a colon ("Onyx timer: 60m.md") opens. Each part is URL-encoded when requested. Writes keep their own,
+     stricter rule: the phone never writes a name like that. */
+  const READ_PART = /^(?!\.)(?!.*\.\.)[^/\\%\u0000-\u001f\u007f]+$/;
+  function readablePath(path) { return typeof path === "string" && path.split("/").every((s) => READ_PART.test(s)); }
+
   /* Reads relative to the repo root. `fetchFn` is injectable so the drill can run it without a server. */
   function LocalSource(base, fetchFn) {
     const f = fetchFn || ((u) => root.fetch(u, { cache: "no-store" }));
     async function get(path) {
-      if (!/^[A-Za-z0-9._\/ -]+$/.test(path) || path.includes("..")) throw new AppError("Refused an odd path", path);
+      if (!readablePath(path)) throw new AppError("Refused an odd path", path);
       let r;
       try { r = await f(base + path.split("/").map(encodeURIComponent).join("/")); }
       catch (e) { throw new AppError("Couldn't reach the snapshot", `${path}: ${e.message || e}`); }
@@ -242,9 +249,9 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
   const ISO = "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[+-]\\d{2}:\\d{2}";
   const EVENT_RULES = {
     "inbox/alerts/": { schema: "schema: alert-ack/v1\n", name: /^([A-Za-z0-9-]{1,60})--ack-\d{8}-\d{6}-[0-9a-f]{12}\.md$/,
-      text: new RegExp(`^schema: alert-ack/v1\\nalert_id: ([A-Za-z0-9-]{1,60})\\nby: [a-z]+\\nat: ${ISO}\\n\\n$`) },
+      text: new RegExp(`^schema: alert-ack/v1\\nalert_id: ([A-Za-z0-9-]{1,60})\\nby: ([a-z]+)\\nat: ${ISO}\\n\\n$`) },
     "inbox/caught-up/": { schema: "schema: caught-up/v1\n", name: /^([a-z0-9-]{1,60})--caught-up-\d{8}-\d{6}-[0-9a-f]{12}\.md$/,
-      text: new RegExp(`^schema: caught-up/v1\\nproject: ([a-z0-9-]{1,60})\\nthrough: [BG]-\\d{4}\\nby: [a-z]+\\n`
+      text: new RegExp(`^schema: caught-up/v1\\nproject: ([a-z0-9-]{1,60})\\nthrough: [BG]-\\d{4}\\nby: ([a-z]+)\\n`
                        + `shown_commit: [0-9a-f]{40}\\nat: ${ISO}\\n\\n$`) },
   };
 
@@ -295,7 +302,7 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
       return pinned;
     }
     async function get(path) {
-      if (!/^[A-Za-z0-9._\/ -]+$/.test(path) || path.includes("..")) throw new AppError("Refused an odd path", path);
+      if (!readablePath(path)) throw new AppError("Refused an odd path", path);
       if (!GITHUB_READABLE.some((p) => path.startsWith(p)) && !GITHUB_READABLE_FILES.includes(path))
         throw new AppError("Refused a path outside the inbox", path);
       if (!pinned) throw new AppError("Not connected yet", "the newest commit hasn't been read");
@@ -303,13 +310,16 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
       return (await call(url, "application/vnd.github.raw+json", path)).text();
     }
     /* Whose key this is: GitHub's own answer (GET /user works with any key), by numeric id. */
+    let me = null;
     async function whoami() {
+      me = null;                                         // a failed check never leaves an older identity in place
       const r = await call(`${(apiBase || "https://api.github.com")}/user`, "application/vnd.github+json", "whose key this is");
       let j;
       try { j = await r.json(); } catch (e) { throw new AppError("GitHub's answer wasn't readable", "whose key this is"); }
       const person = j && PEOPLE_BY_GITHUB_ID[j.id];
       if (!person) throw new AppError("This key isn't one set up here", `it belongs to ${j && j.login || "an unknown account"}`);
-      return { person, login: j.login, id: j.id };
+      me = { person, login: j.login, id: j.id };       // B-1485: writes need this verified identity
+      return { ...me };
     }
 
     /* B-1455, step 4: create ONE new file, never change an existing one (no sha is sent, so GitHub refuses a path
@@ -338,7 +348,14 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
         const n = rule.name.exec(path.slice(dir.length)), t = rule.text.exec(String(text));
         if (!n || !t || n[1] !== t[1])
           throw new AppError("Refused to write that there", `${path}: only a whole ${rule.schema.trim().slice(8)} event, named for what it says`);
+        // B-1485 (Codex, 20261009-204322): an event says who wrote it, and that must be this key's verified person, on
+        // every attempt, a retry included.
+        if (!me || t[2] !== me.person)
+          throw new AppError("Refused to write that there", `${path}: its "by" isn't this key's own person`);
       }
+      // Every write needs whose key this is checked first, and a person whose phone writes (WRITERS; Garrett's waits).
+      if (!me || !WRITERS.includes(me.person))
+        throw new AppError("This key can't write here", me ? `${me.person}'s phone doesn't write yet` : "whose key it is hasn't been checked yet");
       const url = `${base}/contents/${path.split("/").map(encodeURIComponent).join("/")}`;
       const bytes = new TextEncoder().encode(text);
       let bin = "";
@@ -380,7 +397,7 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
       create,
       pinned: () => pinned,
       /* Forget: the key is dropped and anything still loading is cancelled. */
-      close() { key = null; pinned = null; if (ctl) { ctl.abort(); ctl = null; } },
+      close() { key = null; pinned = null; me = null; if (ctl) { ctl.abort(); ctl = null; } },
       text: get,
       async json(path) {
         const t = await get(path);
@@ -482,7 +499,7 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
     const optStr = (v) => v === null || v === undefined || typeof v === "string";
     if (idx.alerts !== undefined && !(Array.isArray(idx.alerts)
         && idx.alerts.every((a) => a && str(a.alert_id) && /^[A-Za-z0-9-]{1,60}$/.test(a.alert_id) && str(a.from)
-                                   && typeof a.text === "string" && typeof a.at === "string")))
+                                   && typeof a.text === "string" && typeof a.at === "string" && (a.to === undefined || a.to === person))))
       throw new AppError("The index's alerts are malformed", person);
     for (const p of idx.projects || [])
       if (!optStr(p.caught_up_through) || (p.since_count !== undefined && !(Number.isInteger(p.since_count) && p.since_count >= 0))
@@ -926,12 +943,63 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
              text: `schema: caught-up/v1\nproject: ${project}\nthrough: ${through}\nby: ${person}\nshown_commit: ${shownCommit}\nat: ${isoLocal(now)}\n\n` };
   }
 
+  /* B-1483/B-1485: one write from the phone, start to finish, so every write fails the same way. `make` returns the
+     event to write (the caller decides whether a pending one is reused); it runs inside, so a refusal while building is
+     a failure too, and nothing is sent. Only GitHub's explicit yes for this exact path counts as written. An uncertain
+     drop keeps this same event for an exact retry; no other failure touches `pending`. It records nothing: the caller
+     records (acked, caught up, cleared the box) only when this says ok. */
+  async function runWrite(source, pending, pkey, make) {
+    let ev = null, sent = false;
+    try {
+      ev = make();
+      sent = true;
+      const r = await source.create(ev.path, ev.text, ev.message);
+      if (!r || r.created !== true || r.path !== ev.path) {
+        // An answer without GitHub's yes doesn't prove nothing landed: keep this exact event, so a retry can't make a
+        // second file (Codex, 20261009-204322).
+        const err = new AppError("GitHub didn't confirm the write", "it isn't counted as recorded; tapping again resends the same file");
+        err.pending = true;
+        throw err;
+      }
+      delete pending[pkey];
+      return { ok: true, ev };
+    } catch (e) {
+      const uncertain = sent && e !== null && typeof e === "object" && !!e.pending;
+      if (uncertain) pending[pkey] = ev;
+      const error = e instanceof AppError ? e
+        : new AppError("The write failed", String((e !== null && typeof e === "object" && e.message) || e));
+      return { ok: false, error, pending: !!pending[pkey] };
+    }
+  }
+
+  /* The writer is the person whose view and index this is, and the key's own person (GitHub mode already forces the
+     view to the key; this doesn't rely on that). Shared by Got it and Caught up. */
+  function checkWriter(idx, viewPerson, keyPerson) {
+    if (!idx || !viewPerson || viewPerson !== keyPerson || idx.person !== viewPerson)
+      throw new AppError("Can't record that from this view", "only the key's own person can write here");
+  }
+  /* B-1483: "Got it" only for an open alert addressed to this person, in the index that drew the strip. The index lists
+     only open, unacknowledged alerts to its person, and each says whom it's to; an index from before that says so
+     refuses rather than guesses. */
+  function checkAlertAck(idx, viewPerson, keyPerson, alertId, shownIdx) {
+    if (shownIdx !== undefined && shownIdx !== idx)
+      throw new AppError("The page refreshed since you saw this", "tap Got it again on what's showing now");
+    checkWriter(idx, viewPerson, keyPerson);
+    const a = (idx.alerts || []).find((x) => x && x.alert_id === alertId);
+    if (!a) throw new AppError("Can't record that", "that alert isn't open for you in this index");
+    if (a.to === undefined) throw new AppError("Can't record that yet", "this index predates the check; Refresh after the next inbox check");
+    if (a.to !== viewPerson) throw new AppError("Can't record that", "that alert isn't addressed to you");
+    return true;
+  }
+
   /* Z-0004: before a "Caught up" is written, it must be the tap the screen offered: the index the project was drawn
      from is still the one showing (a tap after a Refresh is refused), and `through` is the newest row it displayed
-     under "since you last caught up", the only rows the button sits under (Codex, 20261009-202714). */
-  function checkCheckpoint(idx, projectId, through, shownIdx) {
+     under "since you last caught up", the only rows the button sits under (Codex, 20261009-202714). B-1483: and the
+     writer is the key's own person (keyPerson given). */
+  function checkCheckpoint(idx, projectId, through, shownIdx, viewPerson, keyPerson) {
     if (shownIdx !== undefined && shownIdx !== idx)
       throw new AppError("The page refreshed since you saw this", "tap Caught up again on what's showing now");
+    if (viewPerson !== undefined || keyPerson !== undefined) checkWriter(idx, viewPerson, keyPerson);
     const p = ((idx && idx.projects) || []).find((x) => x && x.id === projectId);
     const newest = p && Array.isArray(p.since_rows) && p.since_rows[0] ? p.since_rows[0].number : null;
     if (!p || !/^[BG]-\d{4}$/.test(through || "") || through !== newest)
@@ -1005,10 +1073,10 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
 
   const api = { SCHEMA, PEOPLE, PAGE_SIZE, OLD_AFTER_MIN, AppError, LocalSource, GitHubSource, checkIndex, freshness, sortThreads,
                 filterThreads, paginate, threadState, title, careNow, splitMessage, inline, markdownBlocks, todayBody,
-                entryBody, statusWord, slugWords, sha256Hex, messageSha, receipt, phoneMessage, INTENTS, INTENT_NOTICE, allowedPath, mustPath, entryRole, PEOPLE_BY_GITHUB_ID, WRITERS, locallySeen,
+                entryBody, statusWord, slugWords, sha256Hex, messageSha, receipt, phoneMessage, INTENTS, INTENT_NOTICE, allowedPath, mustPath, entryRole, readablePath, PEOPLE_BY_GITHUB_ID, WRITERS, locallySeen,
                 TOKEN_PATTERNS, looksLikeKey,
                 GITHUB_WRITABLE, GITHUB_READABLE_FILES, EVENT_RULES,
-                todayLists, convo, isDirect, whoOf, ledgerTimeline, alertAck, caughtUpEvent, checkCheckpoint, mapLinks, QUICK_REPLIES, staleNote, nextView };
+                todayLists, convo, isDirect, whoOf, ledgerTimeline, alertAck, caughtUpEvent, checkCheckpoint, checkAlertAck, checkWriter, runWrite, mapLinks, QUICK_REPLIES, staleNote, nextView };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.PhoneApp = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);
@@ -1182,7 +1250,8 @@ function drawChrome() {
     const a = alerts[0];
     const ago = a.at ? A.freshness(a.at, Date.now()).label : "";
     const note = el("div", { class: "note" });
-    const got = el("button", { type: "button", on: { click: () => gotIt(a, got, note) } }, "Got it");
+    const shownIdx = S.idx;               // B-1483: the ack is for the alert THIS strip showed
+    const got = el("button", { type: "button", on: { click: () => gotIt(a, got, note, shownIdx) } }, "Got it");
     if (!canWrite()) got.hidden = true;
     strip.append(el("div", { class: "alertrow", role: "status" },
       el("span", { class: "from" }, `From ${a.from}${ago ? ` · ${ago}` : ""}${alerts.length > 1 ? ` · ${alerts.length - 1} more` : ""}`),
@@ -1316,14 +1385,19 @@ async function drawThread(main, ctx) {
     const pkey = `receipt:${t.path}`;
     const mark = el("button", { type: "button", class: "act", disabled: done, on: { click: async () => {
       mark.disabled = true; status.textContent = "Recording…";
-      try {
-        const rc = S.pending[pkey] || { ...A.receipt(S.person, name, shownMsgSha, shown, new Date(), randHex()),
-                                         msgSha: shownMsgSha, replies: { ...shown } };
-        await src.create(rc.path, rc.text, `Caleb saw ${name} (phone)`).catch((e) => {
-          if (e.pending) S.pending[pkey] = rc;
-          throw e;
-        });
-        delete S.pending[pkey];
+      // A.runWrite (B-1485, Codex 20261009-204322): seen is recorded only on GitHub's confirmed yes, and nothing from an
+      // old session lands in a new one after Forget.
+      const session = src;
+      const r = await A.runWrite(src, S.pending, pkey, () => S.pending[pkey] || { ...A.receipt(S.person, name, shownMsgSha, shown, new Date(), randHex()),
+        msgSha: shownMsgSha, replies: { ...shown }, message: `Caleb saw ${name} (phone)` });
+      if (src !== session) return;
+      if (!r.ok) {
+        mark.disabled = false;
+        status.replaceChildren(errorBox(r.error, r.pending ? "Tap again to retry; it resends the same receipt to the same file." : "Nothing was recorded."));
+        return;
+      }
+      {
+        const rc = r.ev;
         S.recorded[t.path] = { msgSha: rc.msgSha, replies: { ...rc.replies } };
         const unopened = replies.filter((r) => !rc.replies[r.number]).map((r) => r.number);
         if (unopened.length || rc.msgSha !== shownMsgSha) {
@@ -1332,9 +1406,6 @@ async function drawThread(main, ctx) {
             ? `Recorded, but not covered, so still unread: ${unopened.join(", ")}. Open it and mark again.`
             : "Recorded, but the message changed since; mark again to cover this version.";
         } else { mark.textContent = "Seen"; status.textContent = "Seen: recorded from your phone."; }
-      } catch (e) {
-        mark.disabled = false;
-        status.replaceChildren(errorBox(e, S.pending[pkey] ? "Tap again to retry; it resends the same receipt to the same file." : "Nothing was recorded."));
       }
     } } }, done ? "Seen" : "Mark seen");
     if (S.pending[pkey]) status.textContent = "An earlier receipt may not have arrived. Tap to retry it (same file, so never twice).";
@@ -1374,25 +1445,30 @@ function composer(re) {
   }
   showIntent();
   if (p0) { ta.value = p0.words; to.value = p0.to; out.textContent = "An earlier send may not have arrived. Tap Send to retry it (same file, so never twice)."; }
+  // Everything in the composer waits while a send is in flight, so its result can't land on words or a choice made
+  // after it (Codex, 20261009-205003: a success cleared a newer, unsent draft and reset its intent).
+  function lock(on) {
+    for (const c of [ta, to, send, ...kinds, ...quick.querySelectorAll("button")]) c.disabled = on;
+  }
   const send = el("button", { type: "button", class: "act", on: { click: async () => {
-    send.disabled = true; out.textContent = "Sending…";
-    try {
+    lock(true); out.textContent = "Sending…";
+    // A.runWrite (B-1483): a refusal while building, a failed or unconfirmed write all land in the else branch; the box
+    // is cleared and "Sent" said only on GitHub's confirmed yes. A pending send is reused only for identical text.
+    const session = src;
+    const r = await A.runWrite(src, S.pending, pkey, () => {
       const fresh = A.phoneMessage(to.value, re, ta.value, new Date(), randHex(), intent);
       const p = S.pending[pkey];
-      const msg = p && p.text === fresh.text ? p : { ...fresh, words: ta.value, to: to.value, intent };
-      await src.create(msg.path, msg.text, `Caleb (phone) to ${to.value === "zeus" ? "Zeus" : "Fable"}`).catch((e) => {
-        if (e.pending) S.pending[pkey] = msg;
-        throw e;
-      });
-      delete S.pending[pkey];
-      ta.value = "";
-      out.textContent = `Sent to ${to.value === "zeus" ? "Zeus" : "Fable"} as ${A.INTENTS[msg.intent || "message"].word.toLowerCase()} (${msg.path}). `
+      return p && p.text === fresh.text ? p : { ...fresh, words: ta.value, to: to.value, intent,
+        message: `Caleb (phone) to ${to.value === "zeus" ? "Zeus" : "Fable"}` };
+    });
+    if (src !== session) return;          // forgotten mid-send: nothing here belongs to the new session
+    if (r.ok) {
+      if (ta.value === r.ev.words) ta.value = "";   // only the words that were sent; never a newer draft
+      out.textContent = `Sent to ${r.ev.to === "zeus" ? "Zeus" : "Fable"} as ${A.INTENTS[r.ev.intent || "message"].word.toLowerCase()} (${r.ev.path}). `
         + "It's a message, like one through Wren: answered on the next inbox check, and a request, never a go.";
       intent = "message"; showIntent();
-    } catch (e) {
-      out.replaceChildren(errorBox(e, S.pending[pkey] ? "Tap Send again to retry; it reuses the same file, so it can't arrive twice." : "Nothing was sent."));
-    }
-    send.disabled = false;
+    } else out.replaceChildren(errorBox(r.error, r.pending ? "Tap Send again to retry; it reuses the same file, so it can't arrive twice." : "Nothing was sent."));
+    lock(false);
   } } }, "Send");
   // Stage 2: quick replies fill the box; Send still sends (a canned answer is never sent by itself).
   const quick = el("div", { class: "quick" }, A.QUICK_REPLIES.map((q) => el("button", { type: "button",
@@ -1515,23 +1591,23 @@ function nextBlock(p) {
    text), recorded locally only on GitHub's yes, like a seen receipt. */
 async function sendEvent(pkey, build, button, note, done) {
   button.disabled = true; note.textContent = "Recording…";
-  try {
-    const ev = S.pending[pkey] || build();
-    await src.create(ev.path, ev.text, ev.message).catch((e) => { if (e.pending) S.pending[pkey] = ev; throw e; });
-    delete S.pending[pkey];
-    done(ev);
-  } catch (e) {
-    button.disabled = false;
-    note.replaceChildren(errorBox(e, S.pending[pkey] ? "Tap again to retry; it resends the same file, so it can't land twice." : "Nothing was recorded."));
-  }
+  // A.runWrite: only GitHub's confirmed yes is a success, and only then is anything recorded here (B-1483). A write
+  // still running when the key is forgotten changes nothing in the session that follows.
+  const session = src;
+  const r = await A.runWrite(src, S.pending, pkey, () => S.pending[pkey] || build());
+  if (src !== session) return;
+  if (r.ok) { done(r.ev); return; }
+  button.disabled = false;
+  note.replaceChildren(errorBox(r.error, r.pending ? "Tap again to retry; it resends the same file, so it can't land twice." : "Nothing was recorded."));
 }
-function gotIt(a, button, note) {
-  return sendEvent(`ack:${a.alert_id}`, () => ({ ...A.alertAck(S.person, a, new Date(), randHex()), message: `Caleb: got it, ${a.alert_id} (phone)` }),
+function gotIt(a, button, note, shownIdx) {
+  return sendEvent(`ack:${a.alert_id}`, () => A.checkAlertAck(S.idx, S.person, S.me && S.me.person, a.alert_id, shownIdx)
+    && ({ ...A.alertAck(S.person, a, new Date(), randHex()), message: `Caleb: got it, ${a.alert_id} (phone)` }),
     button, note, () => { S.acked[a.alert_id] = true; drawChrome(); });
 }
 function caughtUp(p, through, button, note, shownIdx, shownPin) {
   // A retry resends the pending event exactly as first built (sendEvent); a fresh tap must match what's showing now.
-  return sendEvent(`caught:${p.id}:${through}`, () => A.checkCheckpoint(S.idx, p.id, through, shownIdx) && ({ ...A.caughtUpEvent(S.person, p.id, through, shownPin ? shownPin.sha : "", new Date(), randHex()),
+  return sendEvent(`caught:${p.id}:${through}`, () => A.checkCheckpoint(S.idx, p.id, through, shownIdx, S.person, S.me && S.me.person) && ({ ...A.caughtUpEvent(S.person, p.id, through, shownPin ? shownPin.sha : "", new Date(), randHex()),
     message: `Caleb: caught up on ${p.id} through ${through} (phone)` }),
     button, note, () => { S.caught[p.id] = through; draw(); });
 }
