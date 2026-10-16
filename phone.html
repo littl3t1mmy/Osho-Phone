@@ -92,7 +92,7 @@ dl.fields dd { margin: 0; overflow-wrap: anywhere; }
 .err code { background: none; }
 .note { font-size: 0.82rem; color: var(--muted); }
 .strip { border-top: 1px solid var(--line); background: var(--care-soft); color: var(--care); font-size: 0.85rem; }
-.strip button { all: unset; display: block; width: 100%; padding: 8px 16px; cursor: pointer; box-sizing: border-box; }
+.strip > button { all: unset; display: block; width: 100%; padding: 8px 16px; cursor: pointer; box-sizing: border-box; }
 .strip ul { margin: 0; padding: 0 16px 8px 34px; color: var(--ink); font-size: 0.84rem; }
 .strip li { margin: 3px 0; }
 nav.tabs { display: flex; border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom, 0px); }
@@ -860,6 +860,70 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
     return (t.replies || []).every((r) => rec.replies && rec.replies[r.number]);
   }
 
+  /* 2026-10-16 (Caleb via Wren, "Nothing is saying that I'm actually seeing stuff"): seen, "Got it" and "Caught up"
+     live on THIS device first, so they work with a read-only key. Before this, all three were recorded only on a
+     GitHub write, so a Contents: Read-only key (the README's own setup) wrote nothing, the alert came back and the
+     badge never moved. The state is one small JSON object per person in the page's own storage (no key, no token):
+       seen    message path -> { msgSha, replies: { "B-1234": 1 } }  what was shown when it was opened here
+       acked   alert id -> true
+       caught  project id -> "B-1234"                                 the newest entry caught up through here
+     Writing the same events to the repo is optional, best-effort and silent (the page's syncs). */
+  const LOCAL_KEY = "relay.local.v1.";
+  const SHA64 = /^[0-9a-f]{64}$/, ENTRY_NO = /^[BGZ]-\d{4}$/, ALERT_ID = /^[A-Za-z0-9-]{1,60}$/, PROJECT_ID = /^[a-z0-9-]{1,60}$/;
+  // Null-prototype maps: a stored key like "__proto__" is just a key (Codex-style hardening; paths allow underscores).
+  const dict = () => Object.create(null);
+  function emptyLocal() { return { seen: dict(), acked: dict(), caught: dict() }; }
+  /* Stored text -> state. Anything malformed is dropped entry by entry, never trusted and never a crash. */
+  function localState(raw) {
+    const out = emptyLocal();
+    let j = null;
+    try { j = typeof raw === "string" ? JSON.parse(raw) : null; } catch (e) { j = null; }
+    if (!j || typeof j !== "object") return out;
+    const obj = (v) => v && typeof v === "object" && !Array.isArray(v);
+    // Only strings reach a regex: an object with a broken toString would throw there (Codex 01a14531 #1).
+    const isStr = (v) => typeof v === "string";
+    if (obj(j.seen)) for (const k of Object.keys(j.seen)) {
+      const r = j.seen[k];
+      if (!readablePath(k) || !obj(r) || !isStr(r.msgSha) || !SHA64.test(r.msgSha) || !obj(r.replies)) continue;
+      const reps = dict();
+      for (const n of Object.keys(r.replies)) if (ENTRY_NO.test(n) && r.replies[n]) reps[n] = 1;
+      out.seen[k] = { msgSha: r.msgSha, replies: reps };
+    }
+    if (obj(j.acked)) for (const k of Object.keys(j.acked)) if (ALERT_ID.test(k) && j.acked[k] === true) out.acked[k] = true;
+    if (obj(j.caught)) for (const k of Object.keys(j.caught))
+      if (PROJECT_ID.test(k) && isStr(j.caught[k]) && /^[BG]-\d{4}$/.test(j.caught[k])) out.caught[k] = j.caught[k];
+    return out;
+  }
+  /* Keep only what still matters to this index, so the stored state stays as small as the index: a seen record for a
+     thread the index still calls unseen, an ack for an alert it still lists, a checkpoint newer than the index's own. */
+  function pruneLocal(st, idx) {
+    const out = emptyLocal();
+    if (!idx) return out;
+    const unseen = new Set((idx.threads || []).filter((t) => t && t.seen === false).map((t) => t.path));
+    for (const k of Object.keys(st.seen)) if (unseen.has(k)) out.seen[k] = st.seen[k];
+    const open = new Set((idx.alerts || []).map((a) => a && a.alert_id));
+    for (const k of Object.keys(st.acked)) if (open.has(k)) out.acked[k] = true;
+    for (const p of idx.projects || []) {
+      const c = p && st.caught[p.id];
+      if (c && (!p.caught_up_through || c > p.caught_up_through)) out.caught[p.id] = c;
+    }
+    return out;
+  }
+  /* What opening a thread here records: the message as it was shown, and the replies listed with it. A reply that
+     arrives later isn't in it, so the thread reads as unseen again (locallySeen). */
+  function localSeenRecord(msgSha, replies) {
+    if (typeof msgSha !== "string" || !SHA64.test(msgSha)) throw new AppError("Can't record that as seen", "the message's fingerprint is malformed");
+    const reps = dict();
+    for (const r of Array.isArray(replies) ? replies : []) if (r && typeof r.number === "string" && ENTRY_NO.test(r.number)) reps[r.number] = 1;
+    return { msgSha, replies: reps };
+  }
+  /* The badge and the Unseen chip: the index's unseen threads, less the ones seen on this device. */
+  function unseenCount(threads, seen) {
+    return (threads || []).filter((t) => t && t.seen === false && !locallySeen(t, seen && seen[t.path])).length;
+  }
+  /* A write refused because the key reads only (GitHub's 403/404 on a create): the sync stops trying, silently. */
+  function writeRefused(err) { return !!err && err.message === "Your key can't write"; }
+
   /* Whose key it is, by GitHub's numeric account id (it can't be renamed, unlike a login). Anyone else is refused. */
   const PEOPLE_BY_GITHUB_ID = { 329741736: "caleb", 335827109: "garrett" };
   const WRITERS = ["caleb"];         // Garrett's phone writes wait (B4: revisit before Garrett's phone writes)
@@ -1072,6 +1136,178 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
              via: null, detail: readyNote, counts, entry: { number: k.number, path: k.path, status: "READY", title: k.title || "" } };
   }
 
+  /* The OSA app's loop readout (tools/phone/make_loop.py, inbox/phone-index/loop.json): the real V1 runs, conditions,
+     timings and ids only. Checked whole before anything is drawn: exact keys at every level, and every word one of
+     the generator's own fixed lists (Codex 01a13bd8 r1: a pattern constrains spelling, not content). A malformed or
+     unexpected file is an error, never a half-drawn readout or text the generator wouldn't have let through. */
+  const LOOP_SCHEMA = "phone-loop/v3";
+  const LOOP_CONDITIONS = ["coder", "checks", "judge", "packet", "log"];
+  const LOOP_STEPS = ["dot3 build", "dot3 send", "dot3 grade", "dot4 build", "dot4 send", "dot4 grade", "dot5 record", "dot6 queue"];
+  const LOOP_MEMORY = ["saved", "partial", "retry", "refused", "stuck", "waiting", "cancelled", "open-intent", "unreadable", "other"];
+  const LOOP_OUTCOMES = ["ok", "failed", "halt"];
+  const LOOP_CODES = ["INCONCLUSIVE", "INCONCLUSIVE-BUDGET-EXCEEDED", "INCONCLUSIVE-JUDGE-TRUNCATED", "NON-CONFORMING"];
+  const LOOP_SOURCES = ["ok", "empty", "damaged", "missing", "unreadable", "reader-failed"];
+  const LOOP_ENDED = ["task-end", "halt", "interrupted"];
+  const LOOP_MAX_RUNS = 20, LOOP_MAX_STEPS = 40;
+  const LOOP_RE = {
+    run_id: /^[0-9a-f]{16}-B-[0-9]{4}$/, go: /^B-[0-9]{4}$/, task: /^S[0-9]{1,3}-[0-9]{8}-[0-9]{6}-[0-9]{1,9}$/,
+    scenario: /^S[0-9]{1,3}$/, sha: /^[0-9a-f]{16}$/,
+    stamp: /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:?[0-9]{2})$/,
+  };
+  function checkLoop(d) {
+    const bad = (what) => { throw new AppError("The loop readout's file is malformed", what); };
+    const obj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+    const keys = (o, want, what) => {                                   // exactly these keys, no more, no fewer
+      if (!obj(o)) bad(what);
+      const got = Object.keys(o).sort(), w = [...want].sort();
+      if (got.length !== w.length || got.some((k, i) => k !== w[i])) bad(`${what}: unexpected fields`);
+    };
+    const n = (v) => v === null || (typeof v === "number" && isFinite(v) && v >= 0);
+    const int = (v) => v === null || (Number.isInteger(v) && v >= 0);
+    const s = (v, re) => v === null || (typeof v === "string" && re.test(v));
+    const one = (v, list) => v === null || list.includes(v);
+    const b = (v) => v === null || typeof v === "boolean";
+    keys(d, ["schema", "built_at", "runs", "counts", "sources", "inputs_sha"], "the file");
+    if (d.schema !== LOOP_SCHEMA) bad(`not ${LOOP_SCHEMA}`);
+    if (typeof d.built_at !== "string" || !LOOP_RE.stamp.test(d.built_at) || isNaN(Date.parse(d.built_at))) bad("no build time");
+    if (typeof d.inputs_sha !== "string" || !LOOP_RE.sha.test(d.inputs_sha)) bad("inputs_sha");
+    keys(d.sources, ["metrics", "memory"], "sources");
+    if (!LOOP_SOURCES.includes(d.sources.metrics) || !LOOP_SOURCES.includes(d.sources.memory)) bad("sources");
+    keys(d.counts, ["runs", "complete", "unreadable"], "counts");
+    const c0 = d.counts;
+    if (![c0.runs, c0.complete, c0.unreadable].every((v) => Number.isInteger(v) && v >= 0) || c0.complete > c0.runs) bad("counts");
+    if (!Array.isArray(d.runs) || d.runs.length > LOOP_MAX_RUNS || d.runs.length > c0.runs) bad("runs");
+    for (const r of d.runs) {
+      keys(r, ["run_id", "go", "scenario", "task", "started_at", "ended_at", "ended", "complete", "published", "unverified",
+               "current", "tail_cut", "conditions", "steps", "steps_capped", "timings", "memory"], "a run");
+      if (!LOOP_RE.run_id.test(r.run_id) || !LOOP_RE.go.test(r.go) || !r.run_id.endsWith(`-${r.go}`)) bad("a run's id");
+      if (!s(r.task, LOOP_RE.task) || !s(r.scenario, LOOP_RE.scenario) || !s(r.started_at, LOOP_RE.stamp)
+          || !s(r.ended_at, LOOP_RE.stamp) || !one(r.ended, LOOP_ENDED) || !b(r.complete) || !b(r.published)
+          || !b(r.unverified) || typeof r.steps_capped !== "boolean" || typeof r.tail_cut !== "boolean") bad(`run ${r.go}`);
+      // v3: the step a run in flight is doing now, only while it hasn't ended (make_loop current_of)
+      if (r.current !== null) {
+        keys(r.current, ["step", "since"], `run ${r.go}: current`);
+        if (r.ended !== null || !LOOP_STEPS.includes(r.current.step) || typeof r.current.since !== "string"
+            || !LOOP_RE.stamp.test(r.current.since) || isNaN(Date.parse(r.current.since))) bad(`run ${r.go}: current`);
+      }
+      if (!Array.isArray(r.conditions) || r.conditions.length !== 5) bad(`run ${r.go}: conditions`);
+      r.conditions.forEach((c, i) => {
+        keys(c, ["name", "ok", "problems", "code"], `run ${r.go}: a condition`);
+        if (c.name !== LOOP_CONDITIONS[i] || !b(c.ok) || !int(c.problems) || !one(c.code, LOOP_CODES)) bad(`run ${r.go}: ${LOOP_CONDITIONS[i]}`);
+      });
+      // complete is a claim the evidence has to carry: dot 5 said so, all five are OK and it was published
+      if (r.complete === true && (r.published !== true || !r.conditions.every((c) => c.ok === true))) bad(`run ${r.go}: complete without its evidence`);
+      if (!Array.isArray(r.steps) || r.steps.length > LOOP_MAX_STEPS) bad(`run ${r.go}: steps`);
+      for (const st of r.steps) {
+        keys(st, ["step", "s", "exit", "outcome"], `run ${r.go}: a step`);
+        if (!LOOP_STEPS.includes(st.step) || !n(st.s) || !int(st.exit) || !one(st.outcome, LOOP_OUTCOMES)) bad(`run ${r.go}: a step`);
+      }
+      const t = r.timings;
+      if (t !== null) {
+        keys(t, ["load_s", "work_s", "wall_s", "coder", "judge"], `run ${r.go}: timings`);
+        if (!["load_s", "work_s", "wall_s"].every((k) => n(t[k]))) bad(`run ${r.go}: timings`);
+        if (t.coder !== null) { keys(t.coder, ["load_s", "work_s", "turns"], `run ${r.go}: coder timings`);
+          if (!n(t.coder.load_s) || !n(t.coder.work_s) || !int(t.coder.turns)) bad(`run ${r.go}: coder timings`); }
+        if (t.judge !== null) { keys(t.judge, ["load_s", "work_s", "attempts", "conforming"], `run ${r.go}: judge timings`);
+          if (!n(t.judge.load_s) || !n(t.judge.work_s) || !int(t.judge.attempts) || !int(t.judge.conforming)) bad(`run ${r.go}: judge timings`); }
+      }
+      const m = r.memory;
+      if (m !== null) {
+        keys(m, ["destination", "generation", "status"], `run ${r.go}: memory`);
+        if (!one(m.destination, ["practice", "real"]) || !int(m.generation) || !LOOP_MEMORY.includes(m.status)) bad(`run ${r.go}: memory`);
+      }
+    }
+    return d;
+  }
+  /* A checked run's stations for the replay, in order. Steps are grouped by the station that did them (the dashboard's
+     own mapping, viz/runs.py STEP_STATION); instant bookkeeping steps (build, record, queue) light nothing. Every
+     recorded stage is kept, each with its own problem: a failed condition never hides the stages that ran after it.
+     A station is "ok" only on evidence (exit 0, outcome ok, its condition OK); a failure anywhere makes it a
+     "problem"; anything missing leaves it "unknown", never done (Codex 01a13bd8 r1, 3 and 4). A station's time "s" is
+     null when any of its steps has no duration, so a partial sum is never shown as the whole (r2, 4); "wait" is the
+     known part, only for pacing the animation. */
+  const LOOP_STEP_STATION = { "dot3 send": "coder", "dot3 grade": "gate", "dot4 build": "judge", "dot4 send": "judge", "dot4 grade": "judge" };
+  const LOOP_STATION_CONDITION = { coder: "coder", gate: "checks", judge: "judge" };
+  function loopStages(r) {
+    const out = [];
+    for (const st of r.steps) {
+      const id = LOOP_STEP_STATION[st.step];
+      if (!id) continue;
+      const bad = (st.exit !== null && st.exit !== 0) || st.outcome === "failed" || st.outcome === "halt";
+      const unk = st.exit === null || st.outcome === null || st.s === null;
+      const last = out[out.length - 1];
+      if (last && last.id === id) {
+        last.wait += st.s || 0; last.s = last.s === null || st.s === null ? null : last.s + st.s;
+        last.bad = last.bad || bad; last.unk = last.unk || unk;
+      } else out.push({ id, s: st.s, wait: st.s || 0, bad, unk });
+    }
+    return out.map((g) => {
+      const c = r.conditions.find((x) => x.name === LOOP_STATION_CONDITION[g.id]);
+      const bad = g.bad || (c && c.ok === false), unk = g.unk || !c || c.ok === null;
+      return { id: g.id, s: g.s, wait: g.wait, state: bad ? "problem" : unk ? "unknown" : "ok" };
+    });
+  }
+
+  /* The station a step lights, or null for the instant bookkeeping steps (the same mapping as loopStages). */
+  function loopStation(step) { return Object.prototype.hasOwnProperty.call(LOOP_STEP_STATION, step) ? LOOP_STEP_STATION[step] : null; }
+  /* What a live run's map should show now (phone-loop/v3): every finished stage on its evidence, recomputed whole from
+     each snapshot so a late condition still turns unknown into ok or problem (Codex 01a13cdd d1, 4), then the station
+     of the step the events say is open, "working", but only while the run hasn't ended. Each entry is
+     {id, state, s}; a stage that's working again (the judge's second step) is the same entry, now working. */
+  function loopScene(r) {
+    const out = loopStages(r).map((g) => ({ id: g.id, state: g.state, s: g.s }));
+    const at = r.ended === null && r.current ? loopStation(r.current.step) : null;
+    if (at) {
+      const last = out[out.length - 1];
+      if (last && last.id === at) { last.state = "working"; last.s = null; }
+      else out.push({ id: at, state: "working", s: null });
+    }
+    return out;
+  }
+
+  /* What turns the map that shows `had` into the map for `want` (both loopScene lists): the animation steps the shell
+     plays, in order. A new station gets the bolt from the one before it and its state; a station whose state or time
+     changed gets its new state; a station no longer in the scene (an open step that ended with no step-end, a run
+     interrupted) goes back to idle, unless it's still shown elsewhere (Codex 01a13cdd b1, 1). If a station changed
+     identity mid-list, the whole map is redrawn: [{op:"reset"}] then everything from empty. */
+  function loopSceneOps(had, want) {
+    for (let i = 0; i < Math.min(had.length, want.length); i++)
+      if (had[i].id !== want[i].id) return [{ op: "reset" }, ...loopSceneOps([], want)];
+    const ops = [];
+    want.forEach((w, i) => {
+      const h = had[i];
+      if (!h && i > 0) ops.push({ op: "hop", from: want[i - 1].id, to: w.id });
+      if (!h || h.state !== w.state || h.s !== w.s) ops.push({ op: "node", id: w.id, state: w.state, s: w.s, from: i > 0 ? want[i - 1].id : null });
+    });
+    const shown = new Set(want.map((w) => w.id));
+    for (const h of had.slice(want.length)) if (!shown.has(h.id)) { ops.push({ op: "node", id: h.id, state: "idle", s: null, from: null }); shown.add(h.id); }
+    return ops;
+  }
+
+  /* Which run Live mode follows, from the previous live snapshot (null on the first) and this one (Codex 01a13cdd d1, 2).
+     A followed run is kept by its run_id through its end: if its row is gone (unreadable, or cut by the 20-run cap) it's
+     "missing", status unavailable, never "finished". A finished followed run gives way only to a NEWER run in flight.
+     Nothing is followed on the first snapshot: an open step with no end could be a run killed hours ago, so the card
+     offers "Watch live" instead, and a run is followed by itself only when the evidence moves between two snapshots
+     (its row changed, or it appeared). Only the newest run is ever picked: an older unterminated run never takes over,
+     and a run Caleb dismissed isn't picked again by itself. Answers {id, row, why} or null. */
+  function loopLivePick(prev, d, trackedId, dismissed) {
+    const runs = d.runs, newest = runs[0] || null;
+    const before = (id) => prev ? prev.runs.find((x) => x.run_id === id) || null : undefined;
+    const moved = (r) => { const p = before(r.run_id); return p === null || (p !== undefined && JSON.stringify(p) !== JSON.stringify(r)); };
+    if (trackedId) {
+      const row = runs.find((x) => x.run_id === trackedId) || null;
+      // a finished followed run gives way to a newer run that's in flight and moving, or that appeared already ended
+      // between two checks (Codex 01a13cdd b1, SHOULD 1): either way the newer run is what the map shows next
+      if (row && row.ended !== null && newest && newest.run_id !== trackedId && !(dismissed && dismissed.has(newest.run_id))
+          && moved(newest) && (newest.ended === null || before(newest.run_id) === null))
+        return { id: newest.run_id, row: newest, why: newest.ended === null ? "newer" : "ended-between" };
+      return { id: trackedId, row, why: row ? "tracked" : "missing" };
+    }
+    if (!newest || !prev || (dismissed && dismissed.has(newest.run_id)) || !moved(newest)) return null;
+    return { id: newest.run_id, row: newest, why: newest.ended === null ? "moving" : "ended-between" };
+  }
+
   /* Short canned answers: they fill the reply box, and you still tap Send (never sent by themselves). */
   const QUICK_REPLIES = ["Got it.", "Later.", "Yes, go ahead (as a message)."];
 
@@ -1081,9 +1317,10 @@ select.filter { font: inherit; font-size: 0.82rem; padding: 3px 8px; border: 1px
     return { text: `Data built ${f.label}${f.old ? " · old: tap Refresh" : ""}`, old: f.old };
   }
 
-  const api = { SCHEMA, PEOPLE, PAGE_SIZE, OLD_AFTER_MIN, AppError, LocalSource, GitHubSource, checkIndex, freshness, sortThreads,
+  const api = { SCHEMA, PEOPLE, PAGE_SIZE, OLD_AFTER_MIN, AppError, LocalSource, GitHubSource, checkIndex, LOOP_SCHEMA, checkLoop, loopStages, loopStation, loopScene, loopSceneOps, loopLivePick, freshness, sortThreads,
                 filterThreads, paginate, threadState, title, careNow, splitMessage, inline, markdownBlocks, todayBody,
                 entryBody, statusWord, slugWords, sha256Hex, messageSha, receipt, phoneMessage, INTENTS, INTENT_NOTICE, allowedPath, mustPath, entryRole, readablePath, PEOPLE_BY_GITHUB_ID, WRITERS, locallySeen,
+                LOCAL_KEY, emptyLocal, localState, pruneLocal, localSeenRecord, unseenCount, writeRefused,
                 TOKEN_PATTERNS, looksLikeKey,
                 GITHUB_WRITABLE, GITHUB_READABLE_FILES, EVENT_RULES,
                 todayLists, convo, isDirect, whoOf, ledgerTimeline, alertAck, caughtUpEvent, checkCheckpoint, checkAlertAck, checkWriter, runWrite, mapLinks, QUICK_REPLIES, staleNote, nextView };
@@ -1102,9 +1339,34 @@ const LOOPBACK = location.protocol === "http:" && /^(127\.0\.0\.1|localhost|\[::
 const MODE = LOOPBACK && location.hash !== "#github" ? "local" : "github";
 let src = MODE === "local" ? A.LocalSource(REPO) : null;
 let connGen = 0;            // each Open, Refresh and Forget supersedes every earlier one (Codex, 20261009-082850)
+/* Inside the OSA phone app the key is kept for the person, sealed under Android's Keystore (Caleb, build-3 test:
+   "connect once and remember it securely"): the app is the keeper. The page hands the key over only once GitHub has
+   accepted it, asks for it back when it opens, and drops it on Forget or when GitHub refuses it. In a browser there's
+   no keeper, and the memory-only rule above stands. */
+const KEEPER = (() => { try { const n = window.OSANative; return n && typeof n.ghKeyLoad === "function" ? n : null; } catch (e) { return null; } })();
+const DEAD_KEY = ["GitHub refused the key", "This key isn't one set up here", "That doesn't look like a key"];
+/* Each ask for the kept key is tied to the connection generation it was made in. Typing a key, Forget, or any other
+   connect moves the generation on, so a late answer can't supersede a typed key or bring a forgotten one back
+   (Codex 01a13894). */
+let keyAsk = null;
+/* A random id, not a counter: a counter starts again at 1 on a reload, so an answer to the old page could match the new
+   page's ask (Codex 01a13894 round 3). Nine digits, as the app accepts. */
+const askId = () => String(100000000 + crypto.getRandomValues(new Uint32Array(1))[0] % 900000000);
+function askSavedKey() { if (KEEPER) { keyAsk = { id: askId(), gen: connGen }; KEEPER.ghKeyLoad(keyAsk.id); } }
 const S = { person: "caleb", tab: "today", filter: "all", page: 0, idx: null, open: null, scroll: {}, stripOpen: false,
             gen: 0, loadGen: 0, lfilter: "all", lpage: 0, me: null, recorded: {}, pending: {},
-            lwho: "all", lproj: "all", more: "links", acked: {}, caught: {} };
+            lwho: "all", lproj: "all", more: "links", local: A.emptyLocal(), keyWrites: null };
+/* Seen, "Got it" and "Caught up" are kept on this device (A.localState; 2026-10-16), per person, so they work with a
+   read-only key. S.recorded stays what GitHub confirmed this session. S.keyWrites: null until a sync learns it. */
+function loadLocal(person, idx) {
+  let raw = null;
+  try { raw = localStorage.getItem(A.LOCAL_KEY + person); } catch (e) { raw = null; }
+  try { S.local = A.pruneLocal(A.localState(raw), idx); } catch (e) { S.local = A.emptyLocal(); }   // never blocks a load
+  saveLocal(person);
+}
+function saveLocal(person) {
+  try { localStorage.setItem(A.LOCAL_KEY + (person || S.person), JSON.stringify(S.local)); } catch (e) {}
+}
 try { const th = localStorage.getItem("relay.theme"); if (th === "light" || th === "dark") document.documentElement.dataset.theme = th; } catch (e) {}
 try { const p = localStorage.getItem("relay.person"); if (A.PEOPLE.includes(p)) S.person = p; } catch (e) {}
 
@@ -1152,8 +1414,22 @@ async function loadIndex() {
   catch (e) { err = e; }
   if (mine !== S.loadGen || person !== S.person) return false;      // superseded by a later switch
   S.idx = idx; S.error = err;
+  if (idx) loadLocal(person, idx); else S.local = A.emptyLocal();
   drawFresh();
+  if (window.OSAApp && idx) loadLoop(mine);
   return true;
+}
+/* The OSA app's loop readout (tools/phone/make_loop.py): the real V1 runs, read from the same pinned commit as the
+   index. Only inside the OSA app, which draws it; a missing or malformed file is the readout's own error, never the
+   index's. Handed over as an event, and kept on PhoneBridge.loop for a shell that asks later. */
+async function loadLoop(gen) {
+  const s0 = src;
+  let loop = null, error = null;
+  try { loop = A.checkLoop(await s0.json("inbox/phone-index/loop.json")); }
+  catch (e) { error = e && e.message ? e.message + (e.detail ? ` (${e.detail})` : "") : String(e); }
+  if (gen !== S.loadGen || s0 !== src) return;                        // superseded by a later load or a new key
+  window.PhoneBridge.loop = { loop, error };
+  window.dispatchEvent(new CustomEvent("phonebridge:loop", { detail: window.PhoneBridge.loop }));
 }
 /* Recomputed every minute and whenever the page comes back to the foreground, so an open page ages honestly. */
 function drawFresh() {
@@ -1175,7 +1451,60 @@ function drawFresh() {
 
 /* The key screen (GitHub mode only). The key goes from the box straight into a GitHubSource and the box is emptied;
    nothing else holds it. */
-function drawKeyScreen(err) {
+/* Connect with a key: the one just pasted, or (saved) the one the app kept. A key is kept only after GitHub accepted
+   it and said whose it is; a kept key GitHub turns down is dropped, so a dead key never comes back. */
+async function connect(key, saved) {
+  if (typeof key === "string") key = key.trim();      // the key GitHub accepts is the key that's kept (Codex 01a13894)
+  const mine = ++connGen;
+  let s;
+  const failed = (e) => {
+    if (KEEPER && saved && DEAD_KEY.includes(e.message)) KEEPER.ghKeyForget();   // only the kept key; a mistyped one was never kept
+    drawKeyScreen(e, saved && KEEPER && !DEAD_KEY.includes(e.message));
+  };
+  try { s = A.GitHubSource("littl3t1mmy", "Osho", key); } catch (e) { failed(e); return; }
+  $("#controls").hidden = false;            // Forget key cancels a connection still being made (Codex, 083216)
+  $("#refresh").hidden = true;
+  $("#fresh").textContent = saved ? "Connecting with your saved key…" : "Connecting to GitHub…";
+  try { await s.pin(); }
+  catch (e) { s.close(); if (mine === connGen) failed(e); return; }
+  if (mine !== connGen) { s.close(); return; }   // superseded by another Open or a Forget: this one never connects
+  // Step 3 (B-1455): the key decides whose view this is; the person switch is hidden in GitHub mode. That's
+  // display scoping, not a lock: a key can read the whole repo.
+  let me;
+  try { me = await s.whoami(); }
+  catch (e) { s.close(); if (mine === connGen) failed(e); return; }
+  if (mine !== connGen) { s.close(); return; }
+  if (KEEPER && !saved) KEEPER.ghKeySave(key);
+  if (src && src.close) src.close();
+  src = s;
+  S.me = me; S.keyWrites = null; S.person = me.person; S.open = null; S.page = 0; S.lpage = 0; S.scroll = {};
+  document.querySelector(".seg").hidden = true;
+  $("#controls").hidden = false;
+  $("#refresh").hidden = false;
+  if (await loadIndex()) draw();
+}
+/* What the app calls back with when the page asks for the kept key: connect with it, unless a key is already in use
+   or being typed in (an empty answer means there's none). */
+window.PhoneBridge = {
+  savedKey(k, id) {
+    // the answer must echo the newest ask, made in the current connection generation (Codex 01a13894 round 2)
+    if (!keyAsk || id !== keyAsk.id) return;
+    const asked = keyAsk; keyAsk = null;
+    if (asked.gen !== connGen || src || typeof k !== "string" || !k) return;   // stale, already connected, or none kept
+    connect(k, true);
+  },
+  /* The app's answer to a forget: if the key couldn't be removed from the phone, say so and offer to try again,
+     rather than letting Forget look done while the key would come back next launch (Codex 01a13894). */
+  forgot(ok) {
+    const old = document.getElementById("forget-failed"); if (old) old.remove();
+    if (ok) return;
+    $("#main").prepend(el("div", { id: "forget-failed" },
+      errorBox(new A.AppError("Couldn't remove the saved key from this phone", "it may come back when the app restarts"), "Try again; if it keeps failing, clear the app's storage in Android's settings."),
+      el("p", null, el("button", { type: "button", class: "act", on: { click: () => KEEPER.ghKeyForget() } }, "Remove it again"))));
+  },
+};
+
+function drawKeyScreen(err, retry) {
   S.gen++;
   $("#fresh").textContent = "Not connected";
   $("#fresh").className = "fresh old";
@@ -1183,38 +1512,20 @@ function drawKeyScreen(err) {
   const input = el("input", { type: "password", id: "key", autocomplete: "off", autocapitalize: "off", spellcheck: "false",
     "aria-label": "Your read-only GitHub key", placeholder: "github_pat_…" });
   const open = el("button", { type: "submit" }, "Open");
-  const form = el("form", { class: "keyform", on: { submit: async (ev) => {
+  const form = el("form", { class: "keyform", on: { submit: (ev) => {
     ev.preventDefault();
     const key = input.value;
     input.value = "";
-    const mine = ++connGen;
-    let s;
-    try { s = A.GitHubSource("littl3t1mmy", "Osho", key); } catch (e) { drawKeyScreen(e); return; }
     open.disabled = true;
-    $("#controls").hidden = false;            // Forget key cancels a connection still being made (Codex, 083216)
-    $("#refresh").hidden = true;
-    $("#fresh").textContent = "Connecting to GitHub…";
-    try { await s.pin(); }
-    catch (e) { s.close(); if (mine === connGen) drawKeyScreen(e); return; }
-    if (mine !== connGen) { s.close(); return; }   // superseded by another Open or a Forget: this one never connects
-    // Step 3 (B-1455): the key decides whose view this is; the person switch is hidden in GitHub mode. That's
-    // display scoping, not a lock: a key can read the whole repo.
-    let me;
-    try { me = await s.whoami(); }
-    catch (e) { s.close(); if (mine === connGen) drawKeyScreen(e); return; }
-    if (mine !== connGen) { s.close(); return; }
-    if (src && src.close) src.close();
-    src = s;
-    S.me = me; S.person = me.person; S.open = null; S.page = 0; S.lpage = 0; S.scroll = {};
-    document.querySelector(".seg").hidden = true;
-    $("#controls").hidden = false;
-    $("#refresh").hidden = false;
-    if (await loadIndex()) draw();
+    connect(key, false);
   } } }, input, open);
   $("#main").replaceChildren(...[
     el("h2", null, "Connect to the relay"),
-    el("p", null, "Paste your read-only GitHub key for the Osho repo. It stays in this page's memory only: it's never saved, and it's gone when you close the page."),
-    err ? errorBox(err) : null,
+    el("p", null, KEEPER
+      ? "Paste your read-only GitHub key for the Osho repo. This app keeps it on this phone, sealed by Android's keystore, so you connect once. \"Forget key\" removes it."
+      : "Paste your read-only GitHub key for the Osho repo. It stays in this page's memory only: it's never saved, and it's gone when you close the page."),
+    err ? errorBox(err, retry ? "Your saved key is still kept. Try again when you have signal." : null) : null,
+    retry ? el("p", null, el("button", { type: "button", class: "act", on: { click: askSavedKey } }, "Try the saved key again")) : null,
     form,
     el("p", { class: "note" }, "No key yet? On GitHub: Settings › Developer settings › Fine-grained tokens. Osho only, Contents read-only, with an expiry date (B-1454).")]
     .filter(Boolean));
@@ -1231,7 +1542,12 @@ async function refresh() {
   if (s.kind === "github") {
     $("#fresh").textContent = "Checking GitHub for the newest commit…";
     try { await s.pin(); }
-    catch (e) { if (mine === connGen && s === src) { S.error = e; draw(); } return; }
+    catch (e) {
+      if (mine !== connGen || s !== src) return;      // an older refresh's refusal never touches the current key
+      if (KEEPER && DEAD_KEY.includes(e.message)) KEEPER.ghKeyForget();
+      S.error = e; draw();
+      return;
+    }
     if (mine !== connGen || s !== src) return;
   }
   if (await loadIndex()) draw();
@@ -1244,7 +1560,7 @@ function drawChrome() {
   document.querySelectorAll("nav.tabs button").forEach((b) => {
     if (b.dataset.tab === S.tab && !S.open) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
   });
-  const n = S.idx ? S.idx.counts.unseen : 0;
+  const n = S.idx ? A.unseenCount(S.idx.threads, S.local.seen) : 0;
   $("#badge").hidden = !n;
   $("#badge").textContent = n;
   // Lanes shows Zeus's lane, which is Caleb's index only; Garrett's own lane is his inbox (B-1455).
@@ -1253,20 +1569,18 @@ function drawChrome() {
   const strip = $("#strip");
   const care = S.idx ? A.careNow(S.idx) : [];
   // Stage 2: the direct alert row sits on top of care-now, one alert at a time, until its own "got it".
-  const alerts = S.idx ? (S.idx.alerts || []).filter((a) => !S.acked[a.alert_id]) : [];
+  const alerts = S.idx ? (S.idx.alerts || []).filter((a) => !S.local.acked[a.alert_id]) : [];
   strip.hidden = !care.length && !alerts.length;
   strip.replaceChildren();
   if (alerts.length) {
     const a = alerts[0];
     const ago = a.at ? A.freshness(a.at, Date.now()).label : "";
-    const note = el("div", { class: "note" });
     const shownIdx = S.idx;               // B-1483: the ack is for the alert THIS strip showed
-    const got = el("button", { type: "button", on: { click: () => gotIt(a, got, note, shownIdx) } }, "Got it");
-    if (!canWrite()) got.hidden = true;
+    // Got it works with any key: it's kept on this phone at once, and copied to GitHub only if the key writes.
+    const got = el("button", { type: "button", on: { click: () => gotIt(a, shownIdx) } }, "Got it");
     strip.append(el("div", { class: "alertrow", role: "status" },
       el("span", { class: "from" }, `From ${a.from}${ago ? ` · ${ago}` : ""}${alerts.length > 1 ? ` · ${alerts.length - 1} more` : ""}`),
-      el("div", { class: "row" }, el("span", null, a.text), got), note,
-      canWrite() ? null : el("div", { class: "note" }, "\"Got it\" needs a key that can write.")));
+      el("div", { class: "row" }, el("span", null, a.text), got)));
   }
   if (care.length) {
     const top = care.filter((c) => c.level !== "WHENEVER").length;
@@ -1315,7 +1629,10 @@ async function drawToday(main, ctx) {
 
 function drawInbox(main) {
   // A message marked seen from this phone reads as seen at once; the index catches up on Fable's next cycle.
-  const all = A.sortThreads(S.idx.threads).map((t) => !t.seen && A.locallySeen(t, S.recorded[t.path]) ? { ...t, seen: true, unseen_reason: null } : t);
+  // Seen on this phone (opened here, or all marked seen here) reads as seen; with a read-only key the index never
+  // catches up, and doesn't need to.
+  const all = A.sortThreads(S.idx.threads).map((t) => !t.seen && A.locallySeen(t, S.local.seen[t.path]) ? { ...t, seen: true, unseen_reason: null } : t);
+  const unseenN = all.filter((t) => t.seen === false).length;
   if (canWrite()) main.append(el("div", { class: "acts" }, el("button", { type: "button", class: "act",
     on: { click: () => { S.scroll[`${S.person}/${S.tab}`] = $("#main").scrollTop; S.open = { compose: true }; draw(); } } }, "New message")));
   const shown = A.filterThreads(all, S.filter);
@@ -1325,12 +1642,22 @@ function drawInbox(main) {
     on: { click: () => { S.filter = key; S.page = 0; draw(); } } }, label);
   main.prepend(staleLine(S.idx));
   main.append(el("div", { class: "filters" }, chip("needs", `Needs me (${S.idx.threads.filter((t) => t.asks_you === true).length})`),
-    chip("unseen", `Unseen (${S.idx.counts.unseen})`), chip("all", "All"),
+    chip("unseen", `Unseen (${unseenN})`), chip("all", "All"),
     chip("direct", `Direct (${S.idx.threads.filter(A.isDirect).length})`),
     chip("unprocessed", `Not processed (${S.idx.counts.unprocessed})`),
     el("span", { class: "count" }, `${S.idx.counts.listed} of ${S.idx.counts.messages} listed`)));
   if (S.filter === "needs") main.append(el("p", { class: "note" }, "Messages that declare a question or decision to you. " +
     "Requests from the agents are on Today."));
+  if (unseenN) {
+    // Two taps, not a confirm() dialog (an Android WebView with no chrome client answers confirm() with "no").
+    let armed = false;
+    const allBtn = el("button", { type: "button", class: "act", on: { click: () => {
+      if (!armed) { armed = true; allBtn.textContent = `Tap again to mark all ${unseenN} seen`; return; }
+      for (const t of all) if (t.seen === false) { try { S.local.seen[t.path] = A.localSeenRecord(t.sha, t.replies); } catch (e) {} }
+      saveLocal(); drawChrome(); draw();
+    } } }, `Mark all ${unseenN} seen (this phone)`);
+    main.append(el("div", { class: "acts" }, allBtn));
+  }
   if (!pg.items.length) main.append(el("p", { class: "note" }, S.filter === "unseen" ? "Nothing unseen." : "Nothing here."));
   main.append(el("ol", { class: "threads" }, pg.items.map((t) => {
     const st = A.threadState(t, S.person);
@@ -1356,7 +1683,8 @@ async function drawThread(main, ctx) {
   const st = A.threadState(t, S.person);
   main.append(el("button", { type: "button", class: "back", on: { click: () => { S.open = null; draw(); } } }, "‹ Inbox"));
   main.append(el("h2", null, A.title(t)));
-  main.append(el("div", { class: "state" }, el("span", { class: "pill" + (st.unseen ? " u" : "") }, st.seen),
+  const seenPill = el("span", { class: "pill" + (st.unseen ? " u" : "") }, st.seen);
+  main.append(el("div", { class: "state" }, seenPill,
     el("span", { class: "pill" }, st.answer), el("span", { class: "pill" }, t.format || "message"),
     A.convo(t, S.person).intent ? el("span", { class: `kind intent-${t.intent}` }, A.convo(t, S.person).intent) : null));
   if (t.intent && t.intent !== "message") main.append(el("p", { class: "note" }, A.INTENTS[t.intent].means));
@@ -1384,11 +1712,17 @@ async function drawThread(main, ctx) {
     main.append(box);
   }
   if (!replies.length && t.processed_by) main.append(el("p", { class: "note" }, `${t.processed_by} is older than the ledger this index carries.`));
-  if (canWrite()) {
+  // 2026-10-16: opening a message marks it seen on this phone, covering the message as shown and the replies listed
+  // with it; no key needed. A reply that arrives later makes it unseen again.
+  const rowNow = { ...t, sha: shownMsgSha };
+  if (t.seen === false && !A.locallySeen(rowNow, S.local.seen[t.path])) {
+    try { S.local.seen[t.path] = A.localSeenRecord(shownMsgSha, replies); saveLocal(); drawChrome(); seenPill.textContent = "Seen"; seenPill.className = "pill"; } catch (e) {}
+  }
+  const seenHere = el("p", { class: "note" }, t.seen === false ? "Seen on this phone." : "Seen.");
+  if (canWrite() && S.keyWrites !== false) {
     const name = t.path.split("/").pop();
-    const rowNow = { ...t, sha: shownMsgSha };
     const done = A.locallySeen(rowNow, S.recorded[t.path]);
-    const status = el("p", { class: "note" }, done ? "Seen: recorded from your phone." : "");
+    const status = el("p", { class: "note" }, done ? "Also recorded on GitHub from your phone." : "Optional: record it on GitHub too, so other devices and Fable's tools see it.");
     // A receipt whose answer was lost is kept in S.pending (it survives leaving the screen) and retried EXACTLY as
     // it was, same path and same contents; what's recorded locally is what was actually sent, never what's open
     // now (Codex, 20261009-085756). Replies opened since need another receipt after it.
@@ -1402,10 +1736,17 @@ async function drawThread(main, ctx) {
         msgSha: shownMsgSha, replies: { ...shown }, message: `Caleb saw ${name} (phone)` });
       if (src !== session) return;
       if (!r.ok) {
+        // A read-only key: say so once, calmly, and stop offering it; seen on this phone already stands.
+        if (A.writeRefused(r.error) && !r.pending) {
+          S.keyWrites = false; mark.hidden = true;
+          status.textContent = "This key reads only, so it stays seen on this phone only. That's fine.";
+          return;
+        }
         mark.disabled = false;
-        status.replaceChildren(errorBox(r.error, r.pending ? "Tap again to retry; it resends the same receipt to the same file." : "Nothing was recorded."));
+        status.replaceChildren(errorBox(r.error, r.pending ? "Tap again to retry; it resends the same receipt to the same file." : "Not recorded on GitHub; it's still seen on this phone."));
         return;
       }
+      S.keyWrites = true;
       {
         const rc = r.ev;
         S.recorded[t.path] = { msgSha: rc.msgSha, replies: { ...rc.replies } };
@@ -1415,12 +1756,13 @@ async function drawThread(main, ctx) {
           status.textContent = unopened.length
             ? `Recorded, but not covered, so still unread: ${unopened.join(", ")}. Open it and mark again.`
             : "Recorded, but the message changed since; mark again to cover this version.";
-        } else { mark.textContent = "Seen"; status.textContent = "Seen: recorded from your phone."; }
+        } else { mark.textContent = "Recorded on GitHub"; status.textContent = "Also recorded on GitHub from your phone."; }
       }
-    } } }, done ? "Seen" : "Mark seen");
+    } } }, done ? "Recorded on GitHub" : "Record on GitHub too");
     if (S.pending[pkey]) status.textContent = "An earlier receipt may not have arrived. Tap to retry it (same file, so never twice).";
-    main.append(el("div", { class: "acts" }, mark), status, composer(t.path));
-  } else main.append(writeNote());
+    main.append(seenHere, el("div", { class: "acts" }, mark), status, composer(t.path));
+  } else if (canWrite()) main.append(seenHere, composer(t.path));
+  else main.append(seenHere, writeNote());
 }
 
 /* Step 4 (B-1455): writing from the phone. Only Caleb's key in GitHub mode; Garrett's writes come later (B4). */
@@ -1538,7 +1880,8 @@ function drawProjects(main) {
     // A checkpoint saved from this phone counts until the index catches up; the newer of the two always wins, so a
     // checkpoint never moves backwards (Codex, 20261009-194617). The rows are the newest five of everything since,
     // so when all five are newer than the local checkpoint there may be more: "5+", never an undercount.
-    const local = S.caught[p.id] && (!p.caught_up_through || S.caught[p.id] > p.caught_up_through) ? S.caught[p.id] : null;
+    const mine = S.local.caught[p.id];
+    const local = mine && (!p.caught_up_through || mine > p.caught_up_through) ? mine : null;
     const allRows = p.since_rows || [];
     const sinceRows = local ? allRows.filter((e) => e.number > local) : allRows;
     const total = p.since_count ?? allRows.length;
@@ -1554,9 +1897,12 @@ function drawProjects(main) {
         : `You haven't caught up on this yet: ${sinceCount} ${sinceCount === 1 ? "entry" : "entries"}.`)
         + (sinceCount > sinceRows.length || more ? ` Showing the newest ${sinceRows.length}.` : "")),
       sinceRows.length ? el("ol", { class: "threads" }, sinceRows.map(entryRow)) : null);
-    if (sinceRows.length && canWrite()) {
+    if (sinceRows.length) {
       const note = el("p", { class: "note" });
-      const b = el("button", { type: "button", class: "act", on: { click: () => caughtUp(p, sinceRows[0].number, b, note, shownIdx, shownPin) } }, "Caught up");
+      const b = el("button", { type: "button", class: "act", on: { click: () => {
+        const err = caughtUp(p, sinceRows[0].number, shownIdx, shownPin);
+        if (err) note.replaceChildren(errorBox(err, "Nothing moved."));
+      } } }, "Caught up");
       sec.append(el("div", { class: "acts" }, b), note);
     }
     if (!sinceRows.length && rows.length) sec.append(el("h4", null, "Newest entries"),
@@ -1597,29 +1943,33 @@ function nextBlock(p) {
     v.note ? el("p", { class: "note" }, v.note) : null, v.via ? el("p", { class: "note" }, v.via) : null,
     v.detail ? el("p", { class: "note" }, v.detail) : null, el("p", { class: "note" }, v.counts), more);
 }
-/* "Got it" and "Caught up": one event file each, retried exactly as sent if the answer is lost (same path, same
-   text), recorded locally only on GitHub's yes, like a seen receipt. */
-async function sendEvent(pkey, build, button, note, done) {
-  button.disabled = true; note.textContent = "Recording…";
-  // A.runWrite: only GitHub's confirmed yes is a success, and only then is anything recorded here (B-1483). A write
-  // still running when the key is forgotten changes nothing in the session that follows.
+/* 2026-10-16: the GitHub copy is optional. It's tried only with a key that may write and hasn't been refused this
+   session, runs in the background, and says nothing: a read-only key just stops the tries. The device state is
+   already saved before this runs, so nothing here can bring an alert back or move a checkpoint. */
+function syncQuietly(pkey, build) {
+  if (!canWrite() || S.keyWrites === false) return;
   const session = src;
-  const r = await A.runWrite(src, S.pending, pkey, () => S.pending[pkey] || build());
-  if (src !== session) return;
-  if (r.ok) { done(r.ev); return; }
-  button.disabled = false;
-  note.replaceChildren(errorBox(r.error, r.pending ? "Tap again to retry; it resends the same file, so it can't land twice." : "Nothing was recorded."));
+  A.runWrite(src, S.pending, pkey, () => S.pending[pkey] || build()).then((r) => {
+    if (src !== session) return;
+    if (r.ok) S.keyWrites = true;
+    else if (A.writeRefused(r.error)) { S.keyWrites = false; delete S.pending[pkey]; }
+  }, () => {});
 }
-function gotIt(a, button, note, shownIdx) {
-  return sendEvent(`ack:${a.alert_id}`, () => A.checkAlertAck(S.idx, S.person, S.me && S.me.person, a.alert_id, shownIdx)
-    && ({ ...A.alertAck(S.person, a, new Date(), randHex()), message: `Caleb: got it, ${a.alert_id} (phone)` }),
-    button, note, () => { S.acked[a.alert_id] = true; drawChrome(); });
+function gotIt(a, shownIdx) {
+  S.local.acked[a.alert_id] = true;
+  saveLocal(); drawChrome();
+  syncQuietly(`ack:${a.alert_id}`, () => A.checkAlertAck(S.idx, S.person, S.me && S.me.person, a.alert_id, shownIdx)
+    && ({ ...A.alertAck(S.person, a, new Date(), randHex()), message: `Caleb: got it, ${a.alert_id} (phone)` }));
 }
-function caughtUp(p, through, button, note, shownIdx, shownPin) {
-  // A retry resends the pending event exactly as first built (sendEvent); a fresh tap must match what's showing now.
-  return sendEvent(`caught:${p.id}:${through}`, () => A.checkCheckpoint(S.idx, p.id, through, shownIdx, S.person, S.me && S.me.person) && ({ ...A.caughtUpEvent(S.person, p.id, through, shownPin ? shownPin.sha : "", new Date(), randHex()),
-    message: `Caleb: caught up on ${p.id} through ${through} (phone)` }),
-    button, note, () => { S.caught[p.id] = through; draw(); });
+function caughtUp(p, through, shownIdx, shownPin) {
+  // The checks run first, against what's showing, so a stale tap moves nothing here either.
+  try { A.checkCheckpoint(S.idx, p.id, through, shownIdx); } catch (e) { return e; }
+  if (!S.local.caught[p.id] || through > S.local.caught[p.id]) { S.local.caught[p.id] = through; saveLocal(); }
+  // A retry resends the pending event exactly as first built; a fresh tap must match what's showing now.
+  syncQuietly(`caught:${p.id}:${through}`, () => A.checkCheckpoint(S.idx, p.id, through, shownIdx, S.person, S.me && S.me.person) && ({ ...A.caughtUpEvent(S.person, p.id, through, shownPin ? shownPin.sha : "", new Date(), randHex()),
+    message: `Caleb: caught up on ${p.id} through ${through} (phone)` }));
+  draw();
+  return null;
 }
 /* Stage 2: the More tab - Quick-links (MAP.md, a copy button per path), the Lingo glossary, Settings. */
 async function drawMore(main, ctx) {
@@ -1636,12 +1986,14 @@ async function drawMore(main, ctx) {
     main.append(el("dl", { class: "fields" },
       el("dt", null, "you"), el("dd", null, S.me ? `${S.me.login} (${S.me.person})` : S.person),
       el("dt", null, "source"), el("dd", null, src.kind === "github" ? `GitHub, commit ${p ? p.sha.slice(0, 8) : "?"}` : "working tree (preview)"),
-      el("dt", null, "writes"), el("dd", null, canWrite()
-        ? "this account may write from the phone; the key itself also needs Contents: Read and write"
-        : "read-only here"),
+      el("dt", null, "seen"), el("dd", null, "seen, Got it and Caught up are kept on this phone; no write key needed"),
+      el("dt", null, "writes"), el("dd", null, !canWrite() ? "read-only here"
+        : S.keyWrites === false ? "this key reads only: nothing is copied to GitHub (that's fine)"
+        : S.keyWrites ? "this key writes: Got it and Caught up are also copied to GitHub, and a message on its Record button"
+        : "copied to GitHub too if the key has Contents: Read and write; a read-only key is fine"),
       el("dt", null, "index"), el("dd", null, A.staleNote(ctx.idx.built_at, Date.now()).text)),
       el("p", null, "Theme ", theme),
-      el("p", { class: "note" }, "Your key is held in this page's memory only. \"Forget key\" at the top drops it."));
+      el("p", { class: "note" }, KEEPER ? "This app keeps your key on this phone, sealed by Android's keystore. \"Forget key\" at the top removes it." : "Your key is held in this page's memory only. \"Forget key\" at the top drops it."));
     return;
   }
   const path = S.more === "lingo" ? "docs/core/protocols-and-lingo.md" : "MAP.md";
@@ -1758,10 +2110,11 @@ $("#forget").addEventListener("click", () => {
   connGen++;                                       // a connection still being made never completes after this
   if (src && src.close) src.close();
   src = null; S.idx = null; S.error = null; S.open = null; S.scroll = {}; S.loadGen++; S.me = null; S.recorded = {}; S.pending = {};
-  S.acked = {}; S.caught = {};
+  S.local = A.emptyLocal(); S.keyWrites = null;     // the device's seen state stays in storage; only memory clears
+  if (KEEPER) KEEPER.ghKeyForget();
   drawChrome(); drawKeyScreen();
 });
-(async () => { if (await loadIndex()) draw(); })();
+(async () => { if (await loadIndex()) draw(); if (MODE === "github") askSavedKey(); })();
 </script>
 </body>
 </html>
